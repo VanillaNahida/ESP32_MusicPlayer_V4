@@ -179,23 +179,30 @@ void loop()
 
 void UI_update()
 {
-  static bool play_executed = false;  // 播放执行标志位
-  static bool pause_executed = false; // 暂停执行标志位
+    static bool play_executed = false;  // 播放执行标志位
+    static bool pause_executed = false; // 暂停执行标志位
 
-  if (Music_IsPlaying())
-  {
-    /* UI显示曲目名称，歌手，歌词，显示播放进度，播放时间，总时长，播放状态 */
-    if (!play_executed)
+    if (Music_IsPlaying())
     {
-      _ui_flag_modify(ui_PlayButton, LV_OBJ_FLAG_HIDDEN, _UI_MODIFY_FLAG_ADD);     // 隐藏播放按钮
-      _ui_flag_modify(ui_PauseButton, LV_OBJ_FLAG_HIDDEN, _UI_MODIFY_FLAG_REMOVE); // 显示暂停按钮
-      lv_img_set_angle(ui_citou, 0);                                               // 磁头转到播放位置
-      HaibaoXuanzhuan_Animation(ui_haibao, 0);                                     // 胶片转动
+        /* UI显示曲目名称，歌手，歌词，显示播放进度，播放时间，总时长，播放状态 */
+        if (!play_executed)
+        {
+            _ui_flag_modify(ui_PlayButton, LV_OBJ_FLAG_HIDDEN, _UI_MODIFY_FLAG_ADD);     // 隐藏播放按钮
+            _ui_flag_modify(ui_PauseButton, LV_OBJ_FLAG_HIDDEN, _UI_MODIFY_FLAG_REMOVE); // 显示暂停按钮
+            lv_img_set_angle(ui_citou, 0);                                               // 磁头转到播放位置
+            HaibaoXuanzhuan_Animation(ui_haibao, 0);                                     // 胶片转动
+            // 重新启动歌词和标题标签的滚动动画
+            const char *current_title = lv_label_get_text(ui_MusicTitleLabel);
+            const char *current_lrc = lv_label_get_text(ui_MusicLrcLabel);
+            lv_label_set_text(ui_MusicTitleLabel, current_title);                        // 重新设置标题文本
+            lv_label_set_text(ui_MusicLrcLabel, current_lrc);                            // 重新设置歌词文本
+            lv_label_set_long_mode(ui_MusicTitleLabel, LV_LABEL_LONG_SCROLL_CIRCULAR);   // 重新设置标题标签滚动模式
+            lv_label_set_long_mode(ui_MusicLrcLabel, LV_LABEL_LONG_SCROLL_CIRCULAR);     // 重新设置歌词标签滚动模式
 
-      play_executed = true; // 设置执行标志
-      pause_executed = false;
-      Serial.println("播放执行标志位");
-    }
+            play_executed = true; // 设置执行标志
+            pause_executed = false;
+            Serial.println("播放执行标志位");
+        }
 
     if (music_prev_i != music_i) // 播放歌曲索引与上一个歌曲索引不一致 ,重新解析歌曲信息和歌词
     {
