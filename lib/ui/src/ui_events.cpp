@@ -32,7 +32,19 @@ void NextClicke(lv_event_t *e)
 	{
 		Music_Pause();
 		String fileName = musicFiles[music_i];
-		currentTitle = fileName.substring(0, fileName.lastIndexOf("."));
+		// 去掉路径，只保留文件名
+		int lastSlash = fileName.lastIndexOf("/");
+		if (lastSlash != -1)
+		{
+			fileName = fileName.substring(lastSlash + 1);
+		}
+		// 去掉扩展名
+		int dotIndex = fileName.lastIndexOf(".");
+		if (dotIndex != -1)
+		{
+			fileName = fileName.substring(0, dotIndex);
+		}
+		currentTitle = fileName;
 		lv_label_set_text(ui_Label2, "暂停播放");
 		lv_label_set_text(ui_MusicTitleLabel, currentTitle.c_str()); //  歌曲名
 	}
@@ -92,7 +104,19 @@ void PrevClicked(lv_event_t *e)
 	{
 		Music_Pause();
 		String fileName = musicFiles[music_i];
-		currentTitle = fileName.substring(0, fileName.lastIndexOf("."));
+		// 去掉路径，只保留文件名
+		int lastSlash = fileName.lastIndexOf("/");
+		if (lastSlash != -1)
+		{
+			fileName = fileName.substring(lastSlash + 1);
+		}
+		// 去掉扩展名
+		int dotIndex = fileName.lastIndexOf(".");
+		if (dotIndex != -1)
+		{
+			fileName = fileName.substring(0, dotIndex);
+		}
+		currentTitle = fileName;
 		lv_label_set_text(ui_Label2, "暂停播放");
 		lv_label_set_text(ui_MusicTitleLabel, currentTitle.c_str()); //  歌曲名
 	}
@@ -106,20 +130,18 @@ static void ui_event_list1_handler(lv_event_t *e)
 
 	if (code == LV_EVENT_CLICKED)
 	{
-		// LV_UNUSED(obj);
-		// LV_LOG_USER("Clicked: %s", lv_list_get_button_text(ui_list1, obj));
-		const char *rawName = lv_label_get_text(lv_obj_get_child(obj, 0)); // 获取按钮的标签文本
-		char path[128];													   // 假设最大路径长度为 128
-		snprintf(path, sizeof(path), "%s.mp3", rawName);				   // 构建完整的文件路径
-		Music_PlayPath(path);
-		music_prev_i = music_i;				   // 保存上一首播放的曲目索引
-		for (size_t i = 0; i < fileCount; i++) // 遍历文件列表,获取当前播放的曲目索引
+		// 从按钮的用户数据中获取索引
+		size_t index = (size_t)lv_obj_get_user_data(obj);
+		if (index >= fileCount)
 		{
-			if (musicFiles[i] == path)
-			{
-				music_i = i;
-			}
+			return;
 		}
+		
+		// 从 musicFiles 数组中获取完整路径
+		String fullPath = musicFiles[index];
+		Music_PlayPath(fullPath.c_str());
+		music_prev_i = music_i;				   // 保存上一首播放的曲目索引
+		music_i = index;						   // 直接设置当前播放的曲目索引
 
 		Serial.println(music_prev_i);
 		Serial.println(music_i);
@@ -154,15 +176,23 @@ void PlayListButtonClicked(lv_event_t *e)
 	// 添加 N 个按钮项
 	for (size_t i = 0; i < fileCount; i++)
 	{
-		/*取消.mp3后缀*/
-		String fileName = musicFiles[i];
-		int dotIndex = fileName.lastIndexOf(".");
+		/*取消路径和.mp3后缀*/
+		String fullPath = musicFiles[i];
+		String displayName = fullPath;
+		// 去掉路径，只保留文件名
+		int lastSlash = displayName.lastIndexOf("/");
+		if (lastSlash != -1)
+		{
+			displayName = displayName.substring(lastSlash + 1);
+		}
+		// 去掉扩展名
+		int dotIndex = displayName.lastIndexOf(".");
 		if (dotIndex != -1)
 		{
-			fileName = fileName.substring(0, dotIndex);
+			displayName = displayName.substring(0, dotIndex);
 		}
 
-		ui_list1_btn = lv_list_add_btn(ui_list1, NULL, fileName.c_str());
+		ui_list1_btn = lv_list_add_btn(ui_list1, NULL, displayName.c_str());
 		// 高亮当前播放的歌曲（例如第6首）
 		if (i == music_i)
 		{
@@ -175,10 +205,11 @@ void PlayListButtonClicked(lv_event_t *e)
 			lv_obj_set_style_text_color(ui_list1_btn, lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_DEFAULT);
 		}
 		lv_obj_set_style_bg_opa(ui_list1_btn, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-		lv_obj_set_style_text_font(ui_list1_btn, &ui_font_HONOR_Light12, LV_PART_MAIN | LV_STATE_DEFAULT);
+		lv_obj_set_style_text_font(ui_list1_btn, &ui_font_MengYuanHeiTi_12, LV_PART_MAIN | LV_STATE_DEFAULT);
 		lv_obj_set_style_text_align(ui_list1_btn, LV_TEXT_ALIGN_LEFT, LV_PART_MAIN);
 
-		// 绑定点击事件
+		// 绑定点击事件并存储索引到用户数据
+		lv_obj_set_user_data(ui_list1_btn, (void *)i);
 		lv_obj_add_event_cb(ui_list1_btn, ui_event_list1_handler, LV_EVENT_CLICKED, NULL);
 	}
 }

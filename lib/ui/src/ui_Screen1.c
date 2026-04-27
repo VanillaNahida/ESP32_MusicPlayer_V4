@@ -50,17 +50,20 @@ void ui_Screen1_screen_init(void)
     lv_obj_set_style_border_width(ui_BottomPanel, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
 
     ui_MusicTitleLabel = lv_label_create(ui_BottomPanel);
-    lv_obj_set_width(ui_MusicTitleLabel, LV_SIZE_CONTENT);  /// 1
+    lv_obj_set_width(ui_MusicTitleLabel, 200);  /// 设置固定宽度，超过此宽度时滚动
     lv_obj_set_height(ui_MusicTitleLabel, LV_SIZE_CONTENT); /// 1
     lv_obj_set_x(ui_MusicTitleLabel, 0);
     lv_obj_set_y(ui_MusicTitleLabel, -51);
     lv_obj_set_align(ui_MusicTitleLabel, LV_ALIGN_CENTER);
     lv_label_set_text(ui_MusicTitleLabel, "心中的日月");
+    lv_label_set_long_mode(ui_MusicTitleLabel, LV_LABEL_LONG_SCROLL_CIRCULAR);  /// 设置为循环滚动模式
+    lv_obj_set_style_text_align(ui_MusicTitleLabel, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN | LV_STATE_DEFAULT);  /// 文本居中对齐
     lv_obj_set_style_text_color(ui_MusicTitleLabel, lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_opa(ui_MusicTitleLabel, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_letter_space(ui_MusicTitleLabel, 2, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_line_space(ui_MusicTitleLabel, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_text_font(ui_MusicTitleLabel, &ui_font_HONOR_Light12, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_font(ui_MusicTitleLabel, &ui_font_MengYuanHeiTi_12, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_anim_speed(ui_MusicTitleLabel, 20, LV_PART_MAIN | LV_STATE_DEFAULT);  /// 设置滚动速度（数值越小越慢）
 
     ui_MusicArtistLabel = lv_label_create(ui_BottomPanel);
     lv_obj_set_width(ui_MusicArtistLabel, LV_SIZE_CONTENT);  /// 1
@@ -73,20 +76,23 @@ void ui_Screen1_screen_init(void)
     lv_obj_set_style_text_opa(ui_MusicArtistLabel, 200, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_letter_space(ui_MusicArtistLabel, 2, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_line_space(ui_MusicArtistLabel, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_text_font(ui_MusicArtistLabel, &ui_font_HONOR_Light12, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_font(ui_MusicArtistLabel, &ui_font_MengYuanHeiTi_12, LV_PART_MAIN | LV_STATE_DEFAULT);
 
     ui_MusicLrcLabel = lv_label_create(ui_BottomPanel);
-    lv_obj_set_width(ui_MusicLrcLabel, LV_SIZE_CONTENT);  /// 1
+    lv_obj_set_width(ui_MusicLrcLabel, 200);  /// 设置固定宽度，超过此宽度时滚动
     lv_obj_set_height(ui_MusicLrcLabel, LV_SIZE_CONTENT); /// 1
     lv_obj_set_x(ui_MusicLrcLabel, 0);
     lv_obj_set_y(ui_MusicLrcLabel, -16);
     lv_obj_set_align(ui_MusicLrcLabel, LV_ALIGN_CENTER);
     lv_label_set_text(ui_MusicLrcLabel, "你是我心中的日月光芒");
+    lv_label_set_long_mode(ui_MusicLrcLabel, LV_LABEL_LONG_SCROLL_CIRCULAR);  /// 设置为循环滚动模式
+    lv_obj_set_style_text_align(ui_MusicLrcLabel, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN | LV_STATE_DEFAULT);  /// 文本居中对齐
     lv_obj_set_style_text_color(ui_MusicLrcLabel, lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_opa(ui_MusicLrcLabel, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_letter_space(ui_MusicLrcLabel, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_line_space(ui_MusicLrcLabel, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_text_font(ui_MusicLrcLabel, &ui_font_HONOR_Light12, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_font(ui_MusicLrcLabel, &ui_font_MengYuanHeiTi_12, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_anim_speed(ui_MusicLrcLabel, 20, LV_PART_MAIN | LV_STATE_DEFAULT);  /// 设置滚动速度（数值越小越慢）
 
     ui_Bar1 = lv_bar_create(ui_BottomPanel);
     lv_bar_set_value(ui_Bar1, 25, LV_ANIM_OFF);
@@ -250,7 +256,7 @@ void ui_Screen1_screen_init(void)
     lv_obj_set_style_text_opa(ui_Label2, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_letter_space(ui_Label2, 2, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_line_space(ui_Label2, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_text_font(ui_Label2, &ui_font_HONOR_Light12, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_font(ui_Label2, &ui_font_MengYuanHeiTi_12, LV_PART_MAIN | LV_STATE_DEFAULT);
 
     ui_caidanPanel = lv_obj_create(ui_Screen1);
     lv_obj_set_width(ui_caidanPanel, 148);
@@ -286,7 +292,7 @@ void ui_Screen1_screen_init(void)
     lv_label_set_text(ui_Label1, "播放列表（1/100）");
     lv_obj_set_style_text_color(ui_Label1, lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_opa(ui_Label1, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_text_font(ui_Label1, &ui_font_HONOR_Light12, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_font(ui_Label1, &ui_font_MengYuanHeiTi_12, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_border_width(ui_Label1, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
 
     ui_Panel1 = lv_obj_create(ui_caidanPanel);
@@ -330,7 +336,7 @@ void ui_Screen1_screen_init(void)
     lv_label_set_text(ui_VolumeLabel, "音量：");
     lv_obj_set_style_text_color(ui_VolumeLabel, lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_opa(ui_VolumeLabel, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_text_font(ui_VolumeLabel, &ui_font_HONOR_Light12, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_font(ui_VolumeLabel, &ui_font_MengYuanHeiTi_12, LV_PART_MAIN | LV_STATE_DEFAULT);
 
     ui_VolumeValueLabel = lv_label_create(ui_VolumePanel);
     lv_obj_set_width(ui_VolumeValueLabel, LV_SIZE_CONTENT);  /// 1

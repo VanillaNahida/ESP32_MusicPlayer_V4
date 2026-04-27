@@ -101,6 +101,7 @@ LV_IMG_DECLARE(ui_img_single_loop_png); // assets/SINGLE_LOOP.png
 
 // FONTS
 LV_FONT_DECLARE(ui_font_HONOR_Light12);
+LV_FONT_DECLARE(ui_font_MengYuanHeiTi_12);
 
 // UI INIT
 void ui_init(void);

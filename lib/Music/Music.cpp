@@ -10,7 +10,7 @@
 #define I2S_LRC 26
 
 // 音量
-int volume = 10;
+int volume = 15;
 
 // 最大音乐数量
 const int maxFiles = 50;
@@ -342,7 +342,19 @@ void Music_info()
       if (currentTitle.length() == 0)
       {
         String fileName = musicFiles[music_i];
-        currentTitle = fileName.substring(0, fileName.lastIndexOf("."));
+        // 去掉路径，只保留文件名
+        int lastSlash = fileName.lastIndexOf("/");
+        if (lastSlash != -1)
+        {
+          fileName = fileName.substring(lastSlash + 1);
+        }
+        // 去掉扩展名
+        int dotIndex = fileName.lastIndexOf(".");
+        if (dotIndex != -1)
+        {
+          fileName = fileName.substring(0, dotIndex);
+        }
+        currentTitle = fileName;
       }
 
       // 如果歌手为空，则显示 "未知艺术家"
