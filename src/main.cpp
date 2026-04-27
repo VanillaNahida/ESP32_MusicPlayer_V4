@@ -95,7 +95,7 @@ void setup()
   // 多任务处理部分，使用内核0处理音频播放
   xTaskCreatePinnedToCore(audioTask, "audioTask", 8192, NULL, configMAX_PRIORITIES - 1, &audioTaskHandle, 0);
 
-  Serial.begin(9600); /* prepare for possible serial debug */
+  Serial.begin(115200); /* prepare for possible serial debug */
 
   /* 音频初始化*/
   Music_Init();
