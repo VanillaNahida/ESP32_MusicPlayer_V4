@@ -7,6 +7,21 @@
 #include <Music.h>
 lv_obj_t *ui_list1;
 lv_obj_t *ui_list1_btn;
+lv_obj_t *ui_listCloseBtn;    // 关闭按钮
+lv_obj_t *ui_listPrevBtn;     // 上一页按钮
+lv_obj_t *ui_listNextBtn;     // 下一页按钮
+lv_obj_t *ui_listPageLabel;   // 页码信息标签
+
+// 播放列表分页相关变量
+const int ITEMS_PER_PAGE = 20;   // 每页显示20首
+int currentPage = 0;             // 当前显示的页码（从0开始）
+int totalPages = 0;              // 总页数
+
+// 前向声明
+static void prevPage();
+static void nextPage();
+static void closePlayList(lv_event_t *e);
+
 void PauseClicke(lv_event_t *e)
 {
 	lv_img_set_angle(ui_citou, -200); // 磁头旋转到停止位
@@ -145,37 +160,45 @@ static void ui_event_list1_handler(lv_event_t *e)
 
 		Serial.println(music_prev_i);
 		Serial.println(music_i);
-		lv_obj_add_flag(ui_caidanPanel, LV_OBJ_FLAG_HIDDEN); // 隐藏菜单面板
+		
+		// 保存播放状态
+		savePlayState();
+		
+		// 关闭播放列表
+		closePlayList(NULL);
 		pause_status = 0;									 // 手动暂停标志位取消
 	}
 }
-/*播放列表按钮点击回调函数*/
-void PlayListButtonClicked(lv_event_t *e)
+
+// 清空列表所有项
+static void clearListItems()
 {
+	if (ui_list1 == NULL) return;
+	
+	// 删除列表的所有子对象
+	lv_obj_clean(ui_list1);
+}
 
-	lv_label_set_text_fmt(ui_Label1, "播放列表（%d/%d）", music_i + 1, fileCount + 1);
-	// 如果列表已经存在，先删除旧列表
-	if (ui_list1 != NULL)
+// 加载指定页码的内容
+static void loadPage(int page)
+{
+	if (page < 0 || page >= totalPages || ui_list1 == NULL)
 	{
-		lv_obj_del(ui_list1);
-		ui_list1 = NULL; // 清空指针，防止野指针
+		return;
 	}
-
-	// 创建新列表
-	ui_list1 = lv_list_create(ui_caidanPanel);
-	lv_obj_set_x(ui_list1, 6);
-	lv_obj_set_y(ui_list1, 16);
-	lv_obj_set_width(ui_list1, 148);
-	lv_obj_set_height(ui_list1, 254);
-	lv_obj_set_align(ui_list1, LV_ALIGN_CENTER);
-
-	lv_obj_set_style_bg_color(ui_list1, lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_DEFAULT);
-	lv_obj_set_style_bg_opa(ui_list1, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-	lv_obj_set_style_border_width(ui_list1, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-
-	// 添加 N 个按钮项
-	for (size_t i = 0; i < fileCount; i++)
+	
+	// 清空当前页面
+	clearListItems();
+	
+	// 计算起始和结束索引
+	int startIndex = page * ITEMS_PER_PAGE;
+	int endIndex = min(startIndex + ITEMS_PER_PAGE, fileCount);
+	
+	// 加载这一页的内容
+	for (int i = startIndex; i < endIndex; i++)
 	{
+		if (i < 0 || i >= fileCount) continue;
+		
 		/*取消路径和.mp3后缀*/
 		String fullPath = musicFiles[i];
 		String displayName = fullPath;
@@ -193,15 +216,13 @@ void PlayListButtonClicked(lv_event_t *e)
 		}
 
 		ui_list1_btn = lv_list_add_btn(ui_list1, NULL, displayName.c_str());
-		// 高亮当前播放的歌曲（例如第6首）
+		// 高亮当前播放的歌曲
 		if (i == music_i)
 		{
-
 			lv_obj_set_style_text_color(ui_list1_btn, lv_color_hex(0xff0000), LV_PART_MAIN | LV_STATE_DEFAULT);
 		}
 		else
 		{
-
 			lv_obj_set_style_text_color(ui_list1_btn, lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_DEFAULT);
 		}
 		lv_obj_set_style_bg_opa(ui_list1_btn, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
@@ -209,7 +230,171 @@ void PlayListButtonClicked(lv_event_t *e)
 		lv_obj_set_style_text_align(ui_list1_btn, LV_TEXT_ALIGN_LEFT, LV_PART_MAIN);
 
 		// 绑定点击事件并存储索引到用户数据
-		lv_obj_set_user_data(ui_list1_btn, (void *)i);
+		lv_obj_set_user_data(ui_list1_btn, (void *)(size_t)i);
 		lv_obj_add_event_cb(ui_list1_btn, ui_event_list1_handler, LV_EVENT_CLICKED, NULL);
 	}
+	
+	// 更新页码信息标签
+	if (ui_listPageLabel != NULL)
+	{
+		lv_label_set_text_fmt(ui_listPageLabel, "曲目(%d/%d)-第(%d/%d)页", 
+			music_i + 1, fileCount, currentPage + 1, totalPages);
+	}
+	
+	Serial.printf("已加载第 %d/%d 页\n", page + 1, totalPages);
+}
+
+// 上一页
+static void prevPage()
+{
+	if (currentPage > 0)
+	{
+		currentPage--;
+		loadPage(currentPage);
+	}
+}
+
+// 下一页
+static void nextPage()
+{
+	if (currentPage < totalPages - 1)
+	{
+		currentPage++;
+		loadPage(currentPage);
+	}
+}
+
+// 关闭播放列表
+static void closePlayList(lv_event_t *e)
+{
+	if (ui_list1 != NULL)
+	{
+		lv_obj_del(ui_list1);
+		ui_list1 = NULL;
+	}
+	if (ui_listCloseBtn != NULL)
+	{
+		lv_obj_del(ui_listCloseBtn);
+		ui_listCloseBtn = NULL;
+	}
+	if (ui_listPrevBtn != NULL)
+	{
+		lv_obj_del(ui_listPrevBtn);
+		ui_listPrevBtn = NULL;
+	}
+	if (ui_listNextBtn != NULL)
+	{
+		lv_obj_del(ui_listNextBtn);
+		ui_listNextBtn = NULL;
+	}
+	if (ui_listPageLabel != NULL)
+	{
+		lv_obj_del(ui_listPageLabel);
+		ui_listPageLabel = NULL;
+	}
+}
+
+/*播放列表按钮点击回调函数*/
+void PlayListButtonClicked(lv_event_t *e)
+{
+	lv_label_set_text_fmt(ui_Label1, "播放列表（%d/%d）", music_i + 1, fileCount);
+	
+	// 隐藏原本UI自带的播放列表面板
+	lv_obj_add_flag(ui_caidanPanel, LV_OBJ_FLAG_HIDDEN);
+	
+	// 关闭所有旧的UI元素
+	closePlayList(NULL);
+
+	// 计算总页数
+	totalPages = (fileCount + ITEMS_PER_PAGE - 1) / ITEMS_PER_PAGE;
+	
+	// 计算当前应该显示哪一页（包含当前播放的歌曲）
+	currentPage = music_i / ITEMS_PER_PAGE;
+	
+	// 检查边界
+	if (currentPage >= totalPages) currentPage = totalPages - 1;
+	if (currentPage < 0) currentPage = 0;
+
+	// 创建关闭按钮（左上角）
+	ui_listCloseBtn = lv_btn_create(lv_scr_act());
+	lv_obj_set_size(ui_listCloseBtn, 30, 18);
+	lv_obj_set_pos(ui_listCloseBtn, 0, 20);
+	lv_obj_set_style_bg_color(ui_listCloseBtn, lv_color_hex(0xFF0000), LV_PART_MAIN | LV_STATE_DEFAULT);
+	lv_obj_set_style_bg_opa(ui_listCloseBtn, 200, LV_PART_MAIN | LV_STATE_DEFAULT);
+	lv_obj_set_style_radius(ui_listCloseBtn, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+	lv_obj_set_style_border_width(ui_listCloseBtn, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+	
+	lv_obj_t *closeLabel = lv_label_create(ui_listCloseBtn);
+	lv_label_set_text(closeLabel, "X");
+	lv_obj_center(closeLabel);
+	lv_obj_set_style_text_color(closeLabel, lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_DEFAULT);
+	
+	lv_obj_add_event_cb(ui_listCloseBtn, closePlayList, LV_EVENT_CLICKED, NULL);
+
+	// 创建上一页按钮（关闭按钮右边）
+	ui_listPrevBtn = lv_btn_create(lv_scr_act());
+	lv_obj_set_size(ui_listPrevBtn, 30, 18);
+	lv_obj_set_pos(ui_listPrevBtn, 30, 20);
+	lv_obj_set_style_bg_color(ui_listPrevBtn, lv_color_hex(0x0000FF), LV_PART_MAIN | LV_STATE_DEFAULT);
+	lv_obj_set_style_bg_opa(ui_listPrevBtn, 200, LV_PART_MAIN | LV_STATE_DEFAULT);
+	lv_obj_set_style_radius(ui_listPrevBtn, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+	lv_obj_set_style_border_width(ui_listPrevBtn, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+	
+	lv_obj_t *prevLabel = lv_label_create(ui_listPrevBtn);
+	lv_label_set_text(prevLabel, "<");
+	lv_obj_center(prevLabel);
+	lv_obj_set_style_text_color(prevLabel, lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_DEFAULT);
+	
+	lv_obj_add_event_cb(ui_listPrevBtn, [](lv_event_t *e){ prevPage(); }, LV_EVENT_CLICKED, NULL);
+
+	// 创建下一页按钮（上一页按钮右边）
+	ui_listNextBtn = lv_btn_create(lv_scr_act());
+	lv_obj_set_size(ui_listNextBtn, 30, 18);
+	lv_obj_set_pos(ui_listNextBtn, 60, 20);
+	lv_obj_set_style_bg_color(ui_listNextBtn, lv_color_hex(0x0000FF), LV_PART_MAIN | LV_STATE_DEFAULT);
+	lv_obj_set_style_bg_opa(ui_listNextBtn, 200, LV_PART_MAIN | LV_STATE_DEFAULT);
+	lv_obj_set_style_radius(ui_listNextBtn, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+	lv_obj_set_style_border_width(ui_listNextBtn, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+	
+	lv_obj_t *nextLabel = lv_label_create(ui_listNextBtn);
+	lv_label_set_text(nextLabel, ">");
+	lv_obj_center(nextLabel);
+	lv_obj_set_style_text_color(nextLabel, lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_DEFAULT);
+	
+	lv_obj_add_event_cb(ui_listNextBtn, [](lv_event_t *e){ nextPage(); }, LV_EVENT_CLICKED, NULL);
+
+	// 创建页码信息标签（下一页按钮右边）
+	ui_listPageLabel = lv_label_create(lv_scr_act());
+	lv_obj_set_pos(ui_listPageLabel, 95, 22);
+	lv_label_set_text_fmt(ui_listPageLabel, "曲目(%d/%d) 第(%d/%d)页", 
+		music_i + 1, fileCount, currentPage + 1, totalPages);
+	lv_obj_set_style_text_color(ui_listPageLabel, lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_DEFAULT);
+	lv_obj_set_style_text_font(ui_listPageLabel, &ui_font_MengYuanHeiTi_12, LV_PART_MAIN | LV_STATE_DEFAULT);
+	// 设置黑色背景，和播放列表背景一致
+	lv_obj_set_style_bg_color(ui_listPageLabel, lv_color_hex(0x000000), LV_PART_MAIN | LV_STATE_DEFAULT);
+	lv_obj_set_style_bg_opa(ui_listPageLabel, 200, LV_PART_MAIN | LV_STATE_DEFAULT);
+	lv_obj_set_style_pad_top(ui_listPageLabel, 2, LV_PART_MAIN | LV_STATE_DEFAULT);
+	lv_obj_set_style_pad_bottom(ui_listPageLabel, 2, LV_PART_MAIN | LV_STATE_DEFAULT);
+	lv_obj_set_style_pad_left(ui_listPageLabel, 4, LV_PART_MAIN | LV_STATE_DEFAULT);
+	lv_obj_set_style_pad_right(ui_listPageLabel, 4, LV_PART_MAIN | LV_STATE_DEFAULT);
+
+	// 创建全屏播放列表容器
+	ui_list1 = lv_list_create(lv_scr_act());
+	lv_obj_set_size(ui_list1, 240, 282);  // 全屏大小（减去顶部状态栏20px和控制栏18px）
+	lv_obj_set_pos(ui_list1, 0, 38);  // 从控制栏下方开始
+	lv_obj_set_align(ui_list1, LV_ALIGN_TOP_LEFT);
+
+	// 设置半透明黑色背景
+	lv_obj_set_style_bg_color(ui_list1, lv_color_hex(0x000000), LV_PART_MAIN | LV_STATE_DEFAULT);
+	lv_obj_set_style_bg_opa(ui_list1, 200, LV_PART_MAIN | LV_STATE_DEFAULT);
+	lv_obj_set_style_border_width(ui_list1, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+	lv_obj_set_style_radius(ui_list1, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+
+	// 禁止列表滚动
+	lv_obj_clear_flag(ui_list1, LV_OBJ_FLAG_SCROLLABLE);
+
+	// 加载当前页
+	loadPage(currentPage);
+	
+	Serial.printf("播放列表初始化完成，共 %d 页，当前显示第 %d 页\n", totalPages, currentPage + 1);
 }

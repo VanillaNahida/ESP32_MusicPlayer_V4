@@ -8,14 +8,18 @@
 #define I2S_DOUT 25
 #define I2S_BCLK 27
 #define I2S_LRC 26
+// 播放列表文件路径
+#define PLAYLIST_FILE "/music_playlist.txt"
+// 播放状态文件路径
+#define PLAYSTATE_FILE "/music_state.txt"
 
 // 音量
 int volume = 15;
 
-// 最大音乐数量
-const int maxFiles = 50;
-String musicFiles[maxFiles]; // 定义字符串数组存放音乐文件名称
+// 动态音乐数组
+String* musicFiles = nullptr;
 int fileCount = 0;           // 当前音乐文件数量
+int maxAllocatedFiles = 0;    // 当前已分配的最大音乐文件数量
 String folder = "/";    // 音乐文件夹路径
 int music_i = 0;             // 当前播放索引
 int music_prev_i = 0;        // 上一个播放索引
@@ -61,21 +65,34 @@ void Music_Init()
   audio.setPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
   audio.setVolume(volume); // 设置音量大小，范围0...21
 
-  listMusicFiles(folder); // 列出音乐文件
-  if (fileCount > 0)
+  // 优先尝试加载播放列表，如果不存在则扫描SD卡并创建播放列表
+  if (playlistExists())
   {
-    String music_path = musicFiles[music_i]; // 当前播放路径
-    audio.connecttoFS(SD, music_path.c_str());              // 默认播放第一首
-    while (duration == 0)                                   // 等待歌曲信息获取完毕 获取时长
+    Serial.println("发现播放列表，正在加载...");
+    if (loadPlaylist())
     {
-      Music_info();
+      Serial.printf("成功加载 %d 首歌曲\n", fileCount);
     }
-    parseLrcFile(musicFiles[music_i]); //  歌词解析
-    pause_status = 1;                  // 初始化为暂停状态
-    audio.pauseResume();               // 暂停播放
-   
-    Serial.printf("当前播放: %s\n", music_path.c_str());
+    else
+    {
+      Serial.println("加载播放列表失败，重新扫描...");
+      listMusicFiles(folder); // 列出音乐文件
+      savePlaylist();          // 保存播放列表
+    }
   }
+  else
+  {
+    Serial.println("首次使用，正在扫描SD卡并创建播放列表...");
+    listMusicFiles(folder); // 列出音乐文件
+    if (fileCount > 0)
+    {
+      savePlaylist(); // 保存播放列表
+      Serial.printf("播放列表创建成功，共 %d 首歌曲\n", fileCount);
+    }
+  }
+
+  // 注意：不在这里播放歌曲，等待UI初始化后由 Music_RestorePlayState() 恢复播放状态
+  Serial.printf("播放列表加载完成，共 %d 首歌曲\n", fileCount);
 }
 
 // 主循环处理音频播放
@@ -84,13 +101,12 @@ void Music_Loop()
   audio.loop();
 }
 
-// 递归列出指定目录及所有子目录下的所有音乐文件
-void listMusicFiles(String dir)
+// 辅助函数：实际扫描并添加音乐文件
+void scanAndAddMusicFiles(String dir)
 {
   File root = SD.open(dir);
   if (!root)
   {
-    Serial.println("无法打开目录");
     return;
   }
 
@@ -103,29 +119,37 @@ void listMusicFiles(String dir)
     if (file.isDirectory())
     {
       String subDir = dir + "/" + file.name();
-      listMusicFiles(subDir);
+      scanAndAddMusicFiles(subDir); // 递归处理子目录
     }
     else if (isMusicFile(file.name()))
     {
       String fullPath = dir + "/" + file.name();
-      Serial.print("发现音乐文件: ");
-      Serial.println(fullPath);
-
-      if (fileCount < maxFiles)
-      {
-        musicFiles[fileCount++] = fullPath;
-      }
-      else
-      {
-        Serial.println("达到最大音乐文件数上限");
-        break;
-      }
+      addMusicFile(fullPath);
     }
 
     file.close();
   }
 
   root.close();
+}
+
+// 重写 listMusicFiles 为完整实现
+void listMusicFiles(String dir)
+{
+  // 先释放之前的数组
+  freeMusicArray();
+  
+  // 初始分配 50 个位置
+  if (!allocateMusicArray(50))
+  {
+    Serial.println("无法分配初始音乐数组");
+    return;
+  }
+  
+  // 扫描并添加所有文件
+  scanAndAddMusicFiles(dir);
+  
+  Serial.printf("扫描完成，共发现 %d 首歌曲\n", fileCount);
 }
 
 // 检查是否是音乐文件
@@ -274,6 +298,9 @@ void Music_Next()
   audio.connecttoFS(SD, music_path.c_str());
   Serial.print("下一曲: ");
   Serial.println(musicFiles[music_i]);
+  
+  // 保存播放状态
+  savePlayState();
 }
 
 // 上一曲
@@ -289,6 +316,9 @@ void Music_Prev()
   audio.connecttoFS(SD, music_path.c_str());
   Serial.print("上一曲: ");
   Serial.println(musicFiles[music_i]);
+  
+  // 保存播放状态
+  savePlayState();
 }
 
 // 第一曲
@@ -415,5 +445,289 @@ void setVolume(uint8_t volume)
 /*获取音量值*/
 uint8_t getVolume()
 {
-  return audio.getVolume();
+    return audio.getVolume();
+}
+
+// 检查播放列表是否存在
+bool playlistExists()
+{
+    return SD.exists(PLAYLIST_FILE);
+}
+
+// 保存播放列表到SD卡
+bool savePlaylist()
+{
+    if (fileCount == 0)
+    {
+        Serial.println("没有歌曲可以保存到播放列表");
+        return false;
+    }
+
+    File playlistFile = SD.open(PLAYLIST_FILE, FILE_WRITE);
+    if (!playlistFile)
+    {
+        Serial.println("无法打开播放列表文件进行写入");
+        return false;
+    }
+
+    // 第一行写入歌曲总数
+    playlistFile.println(fileCount);
+    
+    // 逐行写入歌曲路径
+    for (int i = 0; i < fileCount; i++)
+    {
+        playlistFile.println(musicFiles[i]);
+    }
+
+    playlistFile.close();
+    Serial.printf("播放列表保存成功，共 %d 首歌曲\n", fileCount);
+    return true;
+}
+
+// 从SD卡加载播放列表
+bool loadPlaylist()
+{
+    File playlistFile = SD.open(PLAYLIST_FILE);
+    if (!playlistFile)
+    {
+        Serial.println("无法打开播放列表文件进行读取");
+        return false;
+    }
+
+    // 读取第一行的歌曲总数
+    String countLine = playlistFile.readStringUntil('\n');
+    countLine.trim();
+    int storedCount = countLine.toInt();
+    
+    // 验证数量的合法性
+    if (storedCount <= 0)
+    {
+        Serial.println("播放列表格式错误");
+        playlistFile.close();
+        return false;
+    }
+
+    // 分配刚好足够的内存
+    if (!allocateMusicArray(storedCount))
+    {
+        Serial.println("无法分配播放列表内存");
+        playlistFile.close();
+        return false;
+    }
+    
+    // 读取歌曲路径
+    while (playlistFile.available() && fileCount < storedCount)
+    {
+        String line = playlistFile.readStringUntil('\n');
+        line.trim(); // 去除首尾空白字符和换行符
+        if (line.length() > 0)
+        {
+            musicFiles[fileCount++] = line;
+        }
+    }
+
+    playlistFile.close();
+    
+    if (fileCount != storedCount)
+    {
+        Serial.printf("警告：期望加载 %d 首，实际加载 %d 首\n", storedCount, fileCount);
+    }
+    
+    return fileCount > 0;
+}
+
+// 刷新播放列表（重新扫描SD卡）
+void refreshPlaylist()
+{
+    fileCount = 0;
+    listMusicFiles(folder);
+    if (fileCount > 0)
+    {
+        savePlaylist();
+        Serial.printf("播放列表已刷新，共 %d 首歌曲\n", fileCount);
+    }
+    else
+    {
+        Serial.println("刷新失败：未找到任何歌曲");
+    }
+}
+
+// ============== 动态数组管理函数 ==============
+
+// 分配音乐数组
+bool allocateMusicArray(int size)
+{
+    // 先释放之前的内存
+    freeMusicArray();
+    
+    if (size <= 0)
+    {
+        Serial.println("数组大小必须大于0");
+        return false;
+    }
+    
+    musicFiles = new (std::nothrow) String[size];
+    if (musicFiles == nullptr)
+    {
+        Serial.println("内存分配失败");
+        return false;
+    }
+    
+    maxAllocatedFiles = size;
+    fileCount = 0;
+    Serial.printf("已分配内存，可存储 %d 首歌曲\n", size);
+    return true;
+}
+
+// 释放音乐数组
+void freeMusicArray()
+{
+    if (musicFiles != nullptr)
+    {
+        delete[] musicFiles;
+        musicFiles = nullptr;
+    }
+    maxAllocatedFiles = 0;
+    fileCount = 0;
+}
+
+// 添加音乐文件到数组
+bool addMusicFile(String filePath)
+{
+    if (musicFiles == nullptr)
+    {
+        // 如果还没有分配数组，先分配一个初始大小
+        if (!allocateMusicArray(50))
+        {
+            return false;
+        }
+    }
+    
+    // 检查是否需要扩容
+    if (fileCount >= maxAllocatedFiles)
+    {
+        // 扩容：每次增加 50 个位置
+        int newSize = maxAllocatedFiles + 50;
+        String* newArray = new (std::nothrow) String[newSize];
+        if (newArray == nullptr)
+        {
+            Serial.println("扩容失败：内存不足");
+            return false;
+        }
+        
+        // 复制旧数据到新数组
+        for (int i = 0; i < fileCount; i++)
+        {
+            newArray[i] = musicFiles[i];
+        }
+        
+        // 释放旧数组
+        delete[] musicFiles;
+        musicFiles = newArray;
+        maxAllocatedFiles = newSize;
+        Serial.printf("数组已扩容到 %d 首\n", newSize);
+    }
+    
+    // 添加新文件
+    musicFiles[fileCount] = filePath;
+    fileCount++;
+    return true;
+}
+
+// 保存播放状态到SD卡
+bool savePlayState()
+{
+    File stateFile = SD.open(PLAYSTATE_FILE, FILE_WRITE);
+    if (!stateFile)
+    {
+        Serial.println("无法打开播放状态文件进行写入");
+        return false;
+    }
+    
+    // 写入当前播放索引
+    stateFile.println(music_i);
+    
+    stateFile.close();
+    Serial.printf("播放状态已保存：当前曲目索引 = %d\n", music_i);
+    return true;
+}
+
+// 从SD卡加载播放状态
+bool loadPlayState()
+{
+    if (!SD.exists(PLAYSTATE_FILE))
+    {
+        Serial.println("播放状态文件不存在");
+        return false;
+    }
+    
+    File stateFile = SD.open(PLAYSTATE_FILE, FILE_READ);
+    if (!stateFile)
+    {
+        Serial.println("无法打开播放状态文件进行读取");
+        return false;
+    }
+    
+    // 读取当前播放索引
+    String line = stateFile.readStringUntil('\n');
+    line.trim();
+    
+    int savedIndex = line.toInt();
+    
+    // 验证索引合法性
+    if (savedIndex >= 0 && savedIndex < fileCount)
+    {
+        music_i = savedIndex;
+        stateFile.close();
+        Serial.printf("播放状态已加载：当前曲目索引 = %d\n", music_i);
+        return true;
+    }
+    else
+    {
+        stateFile.close();
+        Serial.printf("播放状态索引无效：%d（总曲目数：%d）\n", savedIndex, fileCount);
+        return false;
+    }
+}
+
+// 恢复播放状态（UI初始化后调用）
+void Music_RestorePlayState()
+{
+    bool stateLoaded = false;
+    
+    // 尝试加载播放状态
+    if (loadPlayState())
+    {
+        Serial.printf("恢复上次播放位置：第 %d 首\n", music_i + 1);
+        stateLoaded = true;
+    }
+    else
+    {
+        Serial.println("没有找到播放状态记录，从第一首开始");
+        music_i = 0;  // 默认从第一首开始
+    }
+    
+    // 播放歌曲
+    if (fileCount > 0 && music_i >= 0 && music_i < fileCount)
+    {
+        String music_path = musicFiles[music_i];
+        audio.stopSong();
+        delay(100);
+        audio.connecttoFS(SD, music_path.c_str());
+        
+        // 等待歌曲信息获取完毕
+        while (duration == 0)
+        {
+            Music_info();
+        }
+        
+        // 解析歌词
+        parseLrcFile(musicFiles[music_i]);
+        
+        // 设置为暂停状态
+        pause_status = 1;
+        audio.pauseResume();
+        
+        Serial.printf("已加载：%s\n", music_path.c_str());
+    }
 }

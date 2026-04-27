@@ -141,6 +141,9 @@ void setup()
 
   ui_init();
 
+  // 恢复上次播放状态（UI初始化后）
+  Music_RestorePlayState();
+
   Serial.println("Setup done");
 
   /*初始化后更新页面显示信息*/

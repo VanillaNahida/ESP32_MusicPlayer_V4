@@ -15,22 +15,23 @@ enum PlayMode
 // 全局变量声明
 extern int volume;          // 音量
 extern int fileCount;           // 当前音乐文件总数量
+extern int maxAllocatedFiles;   // 当前已分配的最大音乐文件数量
 extern String folder;
 extern String currentTitle;
 extern String currentArtist;
 extern String currentAlbum;
 extern long duration;
 extern bool durationPrinted;
-extern int music_i;         // 当前播放文件索引
-extern int music_prev_i;    // 上一个播放文件索引
-extern int lyricCount;      // 歌词数量
-extern boolean lrc_flag; // 是否存在歌词标志位
-extern uint8_t lrc_m;       // 歌词分钟
-extern uint8_t lrc_s;       // 歌词秒
-extern boolean lrc_flag;    // 是否存在歌词标志位
-extern struct LyricEntry lyrics[]; // ✅ 结构体数组
+extern int music_i;             // 当前播放文件索引
+extern int music_prev_i;        // 上一个播放文件索引
+extern int lyricCount;          // 歌词数量
+extern boolean lrc_flag;        // 是否存在歌词标志位
+extern uint8_t lrc_m;           // 歌词分钟
+extern uint8_t lrc_s;           // 歌词秒
+extern boolean lrc_flag;        // 是否存在歌词标志位
+extern struct LyricEntry lyrics[]; // 结构体数组
 extern uint16_t temp_AudioCurrentTime;
-extern String musicFiles[];
+extern String* musicFiles;      // 音乐文件数组指针（动态分配）
 extern PlayMode currentPlayMode;
 extern uint8_t pause_status;    // 暂停状态标志位
 
@@ -51,6 +52,20 @@ void Music_info();
 void parseLrcFile(String MusicName);
 uint32_t Music_GetCurrentPlayTime();
 void Music_PlayPath(const char *path);
+
+// 播放列表相关函数
+bool playlistExists();
+bool savePlaylist();
+bool loadPlaylist();
+void refreshPlaylist();
+// 动态数组管理函数
+bool allocateMusicArray(int size);
+void freeMusicArray();
+bool addMusicFile(String filePath);
+// 播放状态记忆函数
+bool savePlayState();
+bool loadPlayState();
+void Music_RestorePlayState();  // 恢复播放状态（UI初始化后调用）
 
 // 结构体定义
 struct LyricEntry
