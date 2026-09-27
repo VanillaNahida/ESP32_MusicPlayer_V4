@@ -80,7 +80,9 @@ SPI3_HOST = 2
   #elif CONFIG_IDF_TARGET_ESP32S2
     #define SPI_PORT 2 //FSPI(ESP32 S2)
   #elif CONFIG_IDF_TARGET_ESP32S3
-    #define SPI_PORT FSPI
+    // 注意：新版 Arduino core 中 S3 的 FSPI 宏值为 0，而 IDF 的 REG_SPI_BASE(i) 要求 i>=2，
+    // 直接用 FSPI 会算出基址 0，导致写 SPI_USER 寄存器时崩溃（地址 0x10）。这里必须用 GPSPI2 编号 2。
+    #define SPI_PORT 2 //FSPI/GPSPI2(ESP32 S3)
   #endif
 #endif
 

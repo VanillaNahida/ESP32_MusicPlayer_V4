@@ -62,7 +62,7 @@ void ui_Screen1_screen_init(void)
     lv_obj_set_style_text_opa(ui_MusicTitleLabel, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_letter_space(ui_MusicTitleLabel, 2, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_line_space(ui_MusicTitleLabel, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_text_font(ui_MusicTitleLabel, &ui_font_MengYuanHeiTi_12, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_font(ui_MusicTitleLabel, &ui_font_AlibabaPuHuiTi_12, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_anim_speed(ui_MusicTitleLabel, 20, LV_PART_MAIN | LV_STATE_DEFAULT);  /// 设置滚动速度（数值越小越慢）
 
     ui_MusicArtistLabel = lv_label_create(ui_BottomPanel);
@@ -76,7 +76,7 @@ void ui_Screen1_screen_init(void)
     lv_obj_set_style_text_opa(ui_MusicArtistLabel, 200, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_letter_space(ui_MusicArtistLabel, 2, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_line_space(ui_MusicArtistLabel, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_text_font(ui_MusicArtistLabel, &ui_font_MengYuanHeiTi_12, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_font(ui_MusicArtistLabel, &ui_font_AlibabaPuHuiTi_12, LV_PART_MAIN | LV_STATE_DEFAULT);
 
     ui_MusicLrcLabel = lv_label_create(ui_BottomPanel);
     lv_obj_set_width(ui_MusicLrcLabel, 200);  /// 设置固定宽度，超过此宽度时滚动
@@ -91,7 +91,7 @@ void ui_Screen1_screen_init(void)
     lv_obj_set_style_text_opa(ui_MusicLrcLabel, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_letter_space(ui_MusicLrcLabel, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_line_space(ui_MusicLrcLabel, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_text_font(ui_MusicLrcLabel, &ui_font_MengYuanHeiTi_12, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_font(ui_MusicLrcLabel, &ui_font_AlibabaPuHuiTi_12, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_anim_speed(ui_MusicLrcLabel, 20, LV_PART_MAIN | LV_STATE_DEFAULT);  /// 设置滚动速度（数值越小越慢）
 
     ui_Bar1 = lv_bar_create(ui_BottomPanel);
@@ -256,7 +256,7 @@ void ui_Screen1_screen_init(void)
     lv_obj_set_style_text_opa(ui_Label2, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_letter_space(ui_Label2, 2, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_line_space(ui_Label2, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_text_font(ui_Label2, &ui_font_MengYuanHeiTi_12, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_font(ui_Label2, &ui_font_AlibabaPuHuiTi_12, LV_PART_MAIN | LV_STATE_DEFAULT);
 
     ui_caidanPanel = lv_obj_create(ui_Screen1);
     lv_obj_set_width(ui_caidanPanel, 148);
@@ -292,7 +292,7 @@ void ui_Screen1_screen_init(void)
     lv_label_set_text(ui_Label1, "曲目（1/100）");
     lv_obj_set_style_text_color(ui_Label1, lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_opa(ui_Label1, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_text_font(ui_Label1, &ui_font_MengYuanHeiTi_12, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_font(ui_Label1, &ui_font_AlibabaPuHuiTi_12, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_border_width(ui_Label1, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
 
     ui_Panel1 = lv_obj_create(ui_caidanPanel);
@@ -336,7 +336,7 @@ void ui_Screen1_screen_init(void)
     lv_label_set_text(ui_VolumeLabel, "音量：");
     lv_obj_set_style_text_color(ui_VolumeLabel, lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_opa(ui_VolumeLabel, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_text_font(ui_VolumeLabel, &ui_font_MengYuanHeiTi_12, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_font(ui_VolumeLabel, &ui_font_AlibabaPuHuiTi_12, LV_PART_MAIN | LV_STATE_DEFAULT);
 
     ui_VolumeValueLabel = lv_label_create(ui_VolumePanel);
     lv_obj_set_width(ui_VolumeValueLabel, LV_SIZE_CONTENT);  /// 1

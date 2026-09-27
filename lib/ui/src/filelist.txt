@@ -18,4 +18,4 @@ ui_img_haibao_png.c
 ui_img_citou_png.c
 ui_img_fanhui_png.c
 ui_img_caidan_png.c
-fonts/ui_font_HONOR_Light12.c
+ui_font_AlibabaPuHuiTi12.c

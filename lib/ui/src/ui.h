@@ -100,11 +100,14 @@ LV_IMG_DECLARE(ui_img_random_play_png); // assets/RANDOM_PLAY.png
 LV_IMG_DECLARE(ui_img_single_loop_png); // assets/SINGLE_LOOP.png
 
 // FONTS
-LV_FONT_DECLARE(ui_font_HONOR_Light12);
-LV_FONT_DECLARE(ui_font_MengYuanHeiTi_12);
+LV_FONT_DECLARE(ui_font_AlibabaPuHuiTi_12);
 
 // UI INIT
 void ui_init(void);
+
+// 主播放界面被销毁后重新创建时调用：让主循环在下一次刷新中重新应用全部界面状态
+// （播放/暂停按钮、标题、歌手、歌词、进度、专辑封面等）
+void UI_NotifyScreenRebuilt(void);
 
 #ifdef __cplusplus
 } /*extern "C"*/

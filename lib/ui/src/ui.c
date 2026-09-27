@@ -187,7 +187,6 @@ void ui_event_PlayButton(lv_event_t *e)
     {
         _ui_flag_modify(ui_PlayButton, LV_OBJ_FLAG_HIDDEN, _UI_MODIFY_FLAG_ADD);
         _ui_flag_modify(ui_PauseButton, LV_OBJ_FLAG_HIDDEN, _UI_MODIFY_FLAG_REMOVE);
-        HaibaoXuanzhuan_Animation(ui_haibao, 0);
         PlayClicked(e);
     }
 }
@@ -251,8 +250,7 @@ void ui_event_ImgButton2(lv_event_t *e)
 
     if (event_code == LV_EVENT_CLICKED)
     {
-        caidanPanelSHOW_Animation(ui_caidanPanel, 0);
-        _ui_flag_modify(ui_caidanPanel, LV_OBJ_FLAG_HIDDEN, _UI_MODIFY_FLAG_REMOVE);
+        // 改为新开播放列表页面（不再使用侧边 caidanPanel）
         PlayListButtonClicked(e);
     }
 }

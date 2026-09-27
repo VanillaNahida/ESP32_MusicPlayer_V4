@@ -162,18 +162,19 @@
 
 // ###### EDIT THE PIN NUMBERS IN THE LINES FOLLOWING TO SUIT YOUR ESP8266 SETUP ######
 
-// For NodeMCU - use pin numbers in the form PIN_Dx where Dx is the NodeMCU pin designation
-#define TFT_MISO 19
-#define TFT_MOSI 23
-#define TFT_SCLK 18
-#define TFT_CS 15  // Chip select control pin
-#define TFT_DC 2// Data Command control pin
-#define TFT_RST 4
+// ESP32-S3 引脚定义（见项目根目录 引脚定义.md）
+#define TFT_MISO 13
+#define TFT_MOSI 11
+#define TFT_SCLK 12
+#define TFT_CS 10  // Chip select control pin
+#define TFT_DC 9   // Data Command control pin
+#define TFT_RST 14
 
-#define TOUCH_CS 22 // Chip select pin (T_CS) of touch screen
-// #define TFT_RST  -1     // Set TFT_RST to -1 if the display RESET is connected to NodeMCU RST or 3.3V
+#define TOUCH_CS 15  // Chip select pin (T_CS) of touch screen
+#define TOUCH_IRQ 40 // Touch interrupt pin (T_IRQ)
 
-// #define TFT_BL PIN_D1  // LED back-light (only for ST7789 with backlight control pin)
+#define TFT_BL 4             // LED back-light control pin
+#define TFT_BACKLIGHT_ON LOW // Level to turn ON back-light (LOW = 低电平点亮)
 
 
 // #define TFT_WR PIN_D2       // Write strobe for modified Raspberry Pi TFT only

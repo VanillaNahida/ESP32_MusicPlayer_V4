@@ -48,9 +48,29 @@ void parseLRC(const char *filename, struct LyricEntry *lyrics, size_t &lyricCoun
 void printLyrics(struct LyricEntry *lyrics, size_t lyricCount);
 uint8_t chartonumber(char charnumber);
 bool Music_IsPlaying();
+
+/*
+  「曲目自然播放结束」事件（消费一次后自动清零）。
+
+  为什么需要它：
+  UI 以前用 !Music_IsPlaying() 来判断「这首歌放完了，该切下一首」，
+  但这个条件在下面三种情况下**同样成立**：
+      1) 曲目真的播完了            <- 只有这种才该自动切歌
+      2) 正在装载下一首（解码器还没跑起来）
+      3) 用户手动暂停了
+  于是 UI 会在 2)、3) 时误判成「播完了」而自动跳到下一首，
+  表现为「UI 显示和实际播放对不上、莫名跳歌」。
+
+  正确做法是让音频侧明确区分「结束了」和「没在播」，由 UI 询问这个
+  专门的标志位，而不是从「是否正在播放」反推。
+*/
+bool Music_ConsumeEnded();
 void Music_info();
 void parseLrcFile(String MusicName);
 uint32_t Music_GetCurrentPlayTime();
+// 获取当前曲目内嵌的专辑封面（原始 JPEG 数据）；无封面时返回 false
+// revision 每换一张封面会变化，供 UI 判断是否需要重新解码显示
+bool Music_GetAlbumCover(const uint8_t **data, size_t *size, uint32_t *revision);
 void Music_PlayPath(const char *path);
 
 // 播放列表相关函数

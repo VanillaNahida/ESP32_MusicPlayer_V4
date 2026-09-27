@@ -5,27 +5,39 @@
 
 #include "ui.h"
 #include <Music.h>
-lv_obj_t *ui_list1;
-lv_obj_t *ui_list1_btn;
-lv_obj_t *ui_listCloseBtn;    // 关闭按钮
-lv_obj_t *ui_listPrevBtn;     // 上一页按钮
-lv_obj_t *ui_listNextBtn;     // 下一页按钮
-lv_obj_t *ui_listPageLabel;   // 页码信息标签
+#include "freertos/task.h"
 
-// 播放列表分页相关变量
-const int ITEMS_PER_PAGE = 20;   // 每页显示20首
-int currentPage = 0;             // 当前显示的页码（从0开始）
-int totalPages = 0;              // 总页数
+// 播放列表页面涉及「新建一整套界面」的重操作，这里打印 LVGL 内存池与任务栈余量，
+// 用于区分「内存耗尽」与「死锁/卡住」两类故障。
+static void plLogMem(const char *tag)
+{
+	lv_mem_monitor_t mon;
+	lv_mem_monitor(&mon);
+	Serial.printf("[PL] %s | lv_mem free=%u biggest=%u used=%u%% frag=%u%% | heap=%u | stack_watermark=%u\n",
+				  tag, (unsigned)mon.free_size, (unsigned)mon.free_biggest_size,
+				  (unsigned)mon.used_pct, (unsigned)mon.frag_pct,
+				  (unsigned)esp_get_free_heap_size(),
+				  (unsigned)uxTaskGetStackHighWaterMark(NULL));
+}
 
 // 前向声明
-static void prevPage();
-static void nextPage();
-static void closePlayList(lv_event_t *e);
+static void plClose(lv_event_t *e);
+static void plPrevPage(lv_event_t *e);
+static void plNextPage(lv_event_t *e);
+static void plPlayItem(lv_event_t *e);
+
+// 播放列表页（独立 screen，打开时销毁主播放界面以节省资源）
+static lv_obj_t *ui_playListScreen = nullptr;
+static lv_obj_t *ui_plList = nullptr;      // 曲目列表
+static lv_obj_t *ui_plPageLabel = nullptr; // 页码信息
+
+const int ITEMS_PER_PAGE = 20; // 每页显示 20 首
+static int plPage = 0;         // 当前页码（从 0 开始）
+static int plTotalPages = 0;   // 总页数
 
 void PauseClicke(lv_event_t *e)
 {
 	lv_img_set_angle(ui_citou, -200); // 磁头旋转到停止位
-	lv_anim_del_all();				  // 删除所有动画
 	pause_status = 1;				  // 手动暂停标志位
 	Music_Pause();					  // 暂停播放音乐
 	lv_label_set_text(ui_Label2, "暂停播放");
@@ -33,8 +45,11 @@ void PauseClicke(lv_event_t *e)
 
 void PlayClicked(lv_event_t *e)
 {
-	lv_img_set_angle(ui_citou, map(Music_GetCurrentPlayTime(), 0, duration, 60, -60)); // 设置磁头转动角度
-	HaibaoXuanzhuan_Animation(ui_haibao, 0);
+	if (duration > 0) // 时长未知时不计算磁头角度，避免 map() 的 min==max 告警
+	{
+		lv_img_set_angle(ui_citou, map(Music_GetCurrentPlayTime(), 0, duration, 60, -60)); // 设置磁头转动角度
+	}
+	// 封面为静态显示，不再启动旋转动画（详见 main.cpp 中的说明）
 	pause_status = 0; // 手动暂停标志位取消
 	Music_Play();
 	lv_label_set_text(ui_Label2, "正在播放");
@@ -137,264 +152,219 @@ void PrevClicked(lv_event_t *e)
 	}
 }
 
-/*播放列表曲目点击回调函数；点击曲目后播放列表中的曲目*/
-static void ui_event_list1_handler(lv_event_t *e)
-{
-	lv_event_code_t code = lv_event_get_code(e);
-	lv_obj_t *obj = lv_event_get_target(e);
+/*==================== 播放列表页 ====================*/
 
-	if (code == LV_EVENT_CLICKED)
+// 取文件名（去掉路径与扩展名）用于列表显示
+static String plDisplayName(const String &path)
+{
+	String name = path;
+	int lastSlash = name.lastIndexOf("/");
+	if (lastSlash != -1)
 	{
-		// 从按钮的用户数据中获取索引
-		size_t index = (size_t)lv_obj_get_user_data(obj);
-		if (index >= fileCount)
-		{
-			return;
-		}
-		
-		// 从 musicFiles 数组中获取完整路径
-		String fullPath = musicFiles[index];
-		Music_PlayPath(fullPath.c_str());
-		music_prev_i = music_i;				   // 保存上一首播放的曲目索引
-		music_i = index;						   // 直接设置当前播放的曲目索引
-
-		Serial.println(music_prev_i);
-		Serial.println(music_i);
-		
-		// 保存播放状态
-		savePlayState();
-		
-		// 关闭播放列表
-		closePlayList(NULL);
-		pause_status = 0;									 // 手动暂停标志位取消
+		name = name.substring(lastSlash + 1);
 	}
+	int dotIndex = name.lastIndexOf(".");
+	if (dotIndex != -1)
+	{
+		name = name.substring(0, dotIndex);
+	}
+	return name;
 }
 
-// 清空列表所有项
-static void clearListItems()
+// 加载指定页
+static void plLoadPage(int page)
 {
-	if (ui_list1 == NULL) return;
-	
-	// 删除列表的所有子对象
-	lv_obj_clean(ui_list1);
-}
-
-// 加载指定页码的内容
-static void loadPage(int page)
-{
-	if (page < 0 || page >= totalPages || ui_list1 == NULL)
+	if (ui_plList == nullptr || plTotalPages <= 0)
 	{
 		return;
 	}
-	
-	// 清空当前页面
-	clearListItems();
-	
-	// 计算起始和结束索引
+	if (page < 0)
+	{
+		page = 0;
+	}
+	if (page >= plTotalPages)
+	{
+		page = plTotalPages - 1;
+	}
+	plPage = page;
+
+	lv_obj_clean(ui_plList);
+
 	int startIndex = page * ITEMS_PER_PAGE;
-	int endIndex = min(startIndex + ITEMS_PER_PAGE, fileCount);
-	
-	// 加载这一页的内容
+	int endIndex = startIndex + ITEMS_PER_PAGE;
+	if (endIndex > fileCount)
+	{
+		endIndex = fileCount;
+	}
+
 	for (int i = startIndex; i < endIndex; i++)
 	{
-		if (i < 0 || i >= fileCount) continue;
-		
-		/*取消路径和.mp3后缀*/
-		String fullPath = musicFiles[i];
-		String displayName = fullPath;
-		// 去掉路径，只保留文件名
-		int lastSlash = displayName.lastIndexOf("/");
-		if (lastSlash != -1)
-		{
-			displayName = displayName.substring(lastSlash + 1);
-		}
-		// 去掉扩展名
-		int dotIndex = displayName.lastIndexOf(".");
-		if (dotIndex != -1)
-		{
-			displayName = displayName.substring(0, dotIndex);
-		}
-
-		ui_list1_btn = lv_list_add_btn(ui_list1, NULL, displayName.c_str());
-		// 高亮当前播放的歌曲
-		if (i == music_i)
-		{
-			lv_obj_set_style_text_color(ui_list1_btn, lv_color_hex(0xff0000), LV_PART_MAIN | LV_STATE_DEFAULT);
-		}
-		else
-		{
-			lv_obj_set_style_text_color(ui_list1_btn, lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_DEFAULT);
-		}
-		lv_obj_set_style_bg_opa(ui_list1_btn, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-		lv_obj_set_style_text_font(ui_list1_btn, &ui_font_MengYuanHeiTi_12, LV_PART_MAIN | LV_STATE_DEFAULT);
-		lv_obj_set_style_text_align(ui_list1_btn, LV_TEXT_ALIGN_LEFT, LV_PART_MAIN);
-
-		// 绑定点击事件并存储索引到用户数据
-		lv_obj_set_user_data(ui_list1_btn, (void *)(size_t)i);
-		lv_obj_add_event_cb(ui_list1_btn, ui_event_list1_handler, LV_EVENT_CLICKED, NULL);
+		lv_obj_t *btn = lv_list_add_btn(ui_plList, NULL, plDisplayName(musicFiles[i]).c_str());
+		lv_obj_set_style_text_font(btn, &ui_font_AlibabaPuHuiTi_12, LV_PART_MAIN | LV_STATE_DEFAULT);
+		lv_obj_set_style_text_align(btn, LV_TEXT_ALIGN_LEFT, LV_PART_MAIN);
+		lv_obj_set_style_bg_opa(btn, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+		// 高亮当前播放曲目
+		lv_obj_set_style_text_color(btn, lv_color_hex(i == music_i ? 0xFF4040 : 0xFFFFFF),
+									LV_PART_MAIN | LV_STATE_DEFAULT);
+		lv_obj_set_user_data(btn, (void *)(size_t)i);
+		lv_obj_add_event_cb(btn, plPlayItem, LV_EVENT_CLICKED, NULL);
 	}
-	
-	// 更新页码信息标签
-	if (ui_listPageLabel != NULL)
+
+	if (ui_plPageLabel != nullptr)
 	{
-		lv_label_set_text_fmt(ui_listPageLabel, "曲目(%d/%d)-第(%d/%d)页", 
-			music_i + 1, fileCount, currentPage + 1, totalPages);
+		lv_label_set_text_fmt(ui_plPageLabel, "第%d/%d页", plPage + 1, plTotalPages);
 	}
-	
-	Serial.printf("已加载第 %d/%d 页\n", page + 1, totalPages);
+
+	Serial.printf("播放列表：第 %d/%d 页\n", plPage + 1, plTotalPages);
 }
 
 // 上一页
-static void prevPage()
+static void plPrevPage(lv_event_t *e)
 {
-	if (currentPage > 0)
+	if (plPage > 0)
 	{
-		currentPage--;
-		loadPage(currentPage);
+		plLoadPage(plPage - 1);
 	}
 }
 
 // 下一页
-static void nextPage()
+static void plNextPage(lv_event_t *e)
 {
-	if (currentPage < totalPages - 1)
+	if (plPage < plTotalPages - 1)
 	{
-		currentPage++;
-		loadPage(currentPage);
+		plLoadPage(plPage + 1);
 	}
 }
 
-// 关闭播放列表
-static void closePlayList(lv_event_t *e)
+// 点击曲目：切歌并返回主播放界面
+static void plPlayItem(lv_event_t *e)
 {
-	if (ui_list1 != NULL)
+	lv_obj_t *obj = lv_event_get_target(e);
+	size_t index = (size_t)lv_obj_get_user_data(obj);
+	if (index >= (size_t)fileCount)
 	{
-		lv_obj_del(ui_list1);
-		ui_list1 = NULL;
+		return;
 	}
-	if (ui_listCloseBtn != NULL)
-	{
-		lv_obj_del(ui_listCloseBtn);
-		ui_listCloseBtn = NULL;
-	}
-	if (ui_listPrevBtn != NULL)
-	{
-		lv_obj_del(ui_listPrevBtn);
-		ui_listPrevBtn = NULL;
-	}
-	if (ui_listNextBtn != NULL)
-	{
-		lv_obj_del(ui_listNextBtn);
-		ui_listNextBtn = NULL;
-	}
-	if (ui_listPageLabel != NULL)
-	{
-		lv_obj_del(ui_listPageLabel);
-		ui_listPageLabel = NULL;
-	}
+
+	music_prev_i = music_i;
+	music_i = (int)index;
+	Music_PlayPath(musicFiles[index].c_str());
+	savePlayState();
+	pause_status = 0; // 手动暂停标志位取消
+
+	plClose(NULL);
 }
 
-/*播放列表按钮点击回调函数*/
+// 关闭列表页：重建主播放界面并销毁列表页
+static void plClose(lv_event_t *e)
+{
+	// 顺序非常重要：必须先重建并切换主界面，最后才删除列表页。
+	// 原因：lv_disp_load_scr() 内部（lv_scr_load_anim）会对「当前活动屏幕」调用
+	// lv_obj_set_pos(lv_scr_act(), 0, 0)。若先把活动屏幕（列表页）删掉，
+	// lv_scr_act() 会返回已释放的野指针，随后解引用 NULL 直接崩溃
+	// （LoadProhibited, EXCVADDR 0x20）。
+	ui_Screen1_screen_init();
+	lv_disp_load_scr(ui_Screen1);
+
+	if (ui_playListScreen != nullptr)
+	{
+		// 当前正处于列表页内按钮的回调中，使用异步删除，
+		// 避免在 LVGL 事件处理过程中释放事件所属对象
+		lv_obj_del_async(ui_playListScreen);
+		ui_playListScreen = nullptr;
+	}
+	ui_plList = nullptr;
+	ui_plPageLabel = nullptr;
+	plPage = 0;
+	plTotalPages = 0;
+
+	// 通知主循环重新应用界面状态
+	UI_NotifyScreenRebuilt();
+}
+
+// 创建一个小按钮
+static lv_obj_t *plMakeButton(lv_obj_t *parent, const char *text, int x, int w, lv_event_cb_t cb)
+{
+	lv_obj_t *btn = lv_btn_create(parent);
+	lv_obj_set_size(btn, w, 22);
+	lv_obj_set_pos(btn, x, 3);
+	lv_obj_set_style_radius(btn, 4, LV_PART_MAIN | LV_STATE_DEFAULT);
+	lv_obj_set_style_border_width(btn, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+	lv_obj_set_style_bg_color(btn, lv_color_hex(0x1F5C7A), LV_PART_MAIN | LV_STATE_DEFAULT);
+	lv_obj_set_style_bg_opa(btn, 220, LV_PART_MAIN | LV_STATE_DEFAULT);
+	lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, NULL);
+
+	lv_obj_t *label = lv_label_create(btn);
+	lv_label_set_text(label, text);
+	lv_obj_set_style_text_font(label, &ui_font_AlibabaPuHuiTi_12, LV_PART_MAIN | LV_STATE_DEFAULT);
+	lv_obj_center(label);
+	return btn;
+}
+
+/*播放列表按钮点击回调：新开播放列表页面，并销毁主播放界面*/
 void PlayListButtonClicked(lv_event_t *e)
 {
-	lv_label_set_text_fmt(ui_Label1, "播放列表（%d/%d）", music_i + 1, fileCount);
-	
-	// 隐藏原本UI自带的播放列表面板
-	lv_obj_add_flag(ui_caidanPanel, LV_OBJ_FLAG_HIDDEN);
-	
-	// 关闭所有旧的UI元素
-	closePlayList(NULL);
+	if (ui_playListScreen != nullptr)
+	{
+		return; // 已经打开
+	}
 
-	// 计算总页数
-	totalPages = (fileCount + ITEMS_PER_PAGE - 1) / ITEMS_PER_PAGE;
-	
-	// 计算当前应该显示哪一页（包含当前播放的歌曲）
-	currentPage = music_i / ITEMS_PER_PAGE;
-	
-	// 检查边界
-	if (currentPage >= totalPages) currentPage = totalPages - 1;
-	if (currentPage < 0) currentPage = 0;
+	plTotalPages = (fileCount + ITEMS_PER_PAGE - 1) / ITEMS_PER_PAGE;
+	if (plTotalPages < 1)
+	{
+		plTotalPages = 1;
+	}
+	plPage = (fileCount > 0) ? (music_i / ITEMS_PER_PAGE) : 0;
+	if (plPage >= plTotalPages)
+	{
+		plPage = plTotalPages - 1;
+	}
 
-	// 创建关闭按钮（左上角）
-	ui_listCloseBtn = lv_btn_create(lv_scr_act());
-	lv_obj_set_size(ui_listCloseBtn, 30, 18);
-	lv_obj_set_pos(ui_listCloseBtn, 0, 20);
-	lv_obj_set_style_bg_color(ui_listCloseBtn, lv_color_hex(0xFF0000), LV_PART_MAIN | LV_STATE_DEFAULT);
-	lv_obj_set_style_bg_opa(ui_listCloseBtn, 200, LV_PART_MAIN | LV_STATE_DEFAULT);
-	lv_obj_set_style_radius(ui_listCloseBtn, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-	lv_obj_set_style_border_width(ui_listCloseBtn, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-	
-	lv_obj_t *closeLabel = lv_label_create(ui_listCloseBtn);
-	lv_label_set_text(closeLabel, "X");
-	lv_obj_center(closeLabel);
-	lv_obj_set_style_text_color(closeLabel, lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_DEFAULT);
-	
-	lv_obj_add_event_cb(ui_listCloseBtn, closePlayList, LV_EVENT_CLICKED, NULL);
+	plLogMem("打开列表页: 进入");
 
-	// 创建上一页按钮（关闭按钮右边）
-	ui_listPrevBtn = lv_btn_create(lv_scr_act());
-	lv_obj_set_size(ui_listPrevBtn, 30, 18);
-	lv_obj_set_pos(ui_listPrevBtn, 30, 20);
-	lv_obj_set_style_bg_color(ui_listPrevBtn, lv_color_hex(0x0000FF), LV_PART_MAIN | LV_STATE_DEFAULT);
-	lv_obj_set_style_bg_opa(ui_listPrevBtn, 200, LV_PART_MAIN | LV_STATE_DEFAULT);
-	lv_obj_set_style_radius(ui_listPrevBtn, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-	lv_obj_set_style_border_width(ui_listPrevBtn, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-	
-	lv_obj_t *prevLabel = lv_label_create(ui_listPrevBtn);
-	lv_label_set_text(prevLabel, "<");
-	lv_obj_center(prevLabel);
-	lv_obj_set_style_text_color(prevLabel, lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_DEFAULT);
-	
-	lv_obj_add_event_cb(ui_listPrevBtn, [](lv_event_t *e){ prevPage(); }, LV_EVENT_CLICKED, NULL);
+	// 目标对象即将被销毁，先停掉正在运行的动画（如海报旋转）
+	lv_anim_del_all();
 
-	// 创建下一页按钮（上一页按钮右边）
-	ui_listNextBtn = lv_btn_create(lv_scr_act());
-	lv_obj_set_size(ui_listNextBtn, 30, 18);
-	lv_obj_set_pos(ui_listNextBtn, 60, 20);
-	lv_obj_set_style_bg_color(ui_listNextBtn, lv_color_hex(0x0000FF), LV_PART_MAIN | LV_STATE_DEFAULT);
-	lv_obj_set_style_bg_opa(ui_listNextBtn, 200, LV_PART_MAIN | LV_STATE_DEFAULT);
-	lv_obj_set_style_radius(ui_listNextBtn, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-	lv_obj_set_style_border_width(ui_listNextBtn, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-	
-	lv_obj_t *nextLabel = lv_label_create(ui_listNextBtn);
-	lv_label_set_text(nextLabel, ">");
-	lv_obj_center(nextLabel);
-	lv_obj_set_style_text_color(nextLabel, lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_DEFAULT);
-	
-	lv_obj_add_event_cb(ui_listNextBtn, [](lv_event_t *e){ nextPage(); }, LV_EVENT_CLICKED, NULL);
+	ui_playListScreen = lv_obj_create(NULL);
+	lv_obj_clear_flag(ui_playListScreen, LV_OBJ_FLAG_SCROLLABLE);
+	lv_obj_set_style_bg_color(ui_playListScreen, lv_color_hex(0x0B283D), LV_PART_MAIN | LV_STATE_DEFAULT);
+	lv_obj_set_style_bg_opa(ui_playListScreen, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
 
-	// 创建页码信息标签（下一页按钮右边）
-	ui_listPageLabel = lv_label_create(lv_scr_act());
-	lv_obj_set_pos(ui_listPageLabel, 95, 22);
-	lv_label_set_text_fmt(ui_listPageLabel, "曲目(%d/%d) 第(%d/%d)页", 
-		music_i + 1, fileCount, currentPage + 1, totalPages);
-	lv_obj_set_style_text_color(ui_listPageLabel, lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_DEFAULT);
-	lv_obj_set_style_text_font(ui_listPageLabel, &ui_font_MengYuanHeiTi_12, LV_PART_MAIN | LV_STATE_DEFAULT);
-	// 设置黑色背景，和播放列表背景一致
-	lv_obj_set_style_bg_color(ui_listPageLabel, lv_color_hex(0x000000), LV_PART_MAIN | LV_STATE_DEFAULT);
-	lv_obj_set_style_bg_opa(ui_listPageLabel, 200, LV_PART_MAIN | LV_STATE_DEFAULT);
-	lv_obj_set_style_pad_top(ui_listPageLabel, 2, LV_PART_MAIN | LV_STATE_DEFAULT);
-	lv_obj_set_style_pad_bottom(ui_listPageLabel, 2, LV_PART_MAIN | LV_STATE_DEFAULT);
-	lv_obj_set_style_pad_left(ui_listPageLabel, 4, LV_PART_MAIN | LV_STATE_DEFAULT);
-	lv_obj_set_style_pad_right(ui_listPageLabel, 4, LV_PART_MAIN | LV_STATE_DEFAULT);
+	// 顶部工具栏：返回 / 上一页 / 下一页 / 页码
+	plMakeButton(ui_playListScreen, "返回", 3, 54, plClose);
+	plMakeButton(ui_playListScreen, "上一页", 62, 56, plPrevPage);
+	plMakeButton(ui_playListScreen, "下一页", 122, 56, plNextPage);
 
-	// 创建全屏播放列表容器
-	ui_list1 = lv_list_create(lv_scr_act());
-	lv_obj_set_size(ui_list1, 240, 282);  // 全屏大小（减去顶部状态栏20px和控制栏18px）
-	lv_obj_set_pos(ui_list1, 0, 38);  // 从控制栏下方开始
-	lv_obj_set_align(ui_list1, LV_ALIGN_TOP_LEFT);
+	ui_plPageLabel = lv_label_create(ui_playListScreen);
+	lv_obj_set_pos(ui_plPageLabel, 184, 8);
+	lv_obj_set_style_text_font(ui_plPageLabel, &ui_font_AlibabaPuHuiTi_12, LV_PART_MAIN | LV_STATE_DEFAULT);
+	lv_obj_set_style_text_color(ui_plPageLabel, lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_DEFAULT);
 
-	// 设置半透明黑色背景
-	lv_obj_set_style_bg_color(ui_list1, lv_color_hex(0x000000), LV_PART_MAIN | LV_STATE_DEFAULT);
-	lv_obj_set_style_bg_opa(ui_list1, 200, LV_PART_MAIN | LV_STATE_DEFAULT);
-	lv_obj_set_style_border_width(ui_list1, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-	lv_obj_set_style_radius(ui_list1, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+	// 曲目列表
+	ui_plList = lv_list_create(ui_playListScreen);
+	lv_obj_set_size(ui_plList, 240, 292);
+	lv_obj_set_pos(ui_plList, 0, 28);
+	lv_obj_set_style_radius(ui_plList, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+	lv_obj_set_style_border_width(ui_plList, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+	lv_obj_set_style_bg_color(ui_plList, lv_color_hex(0x000000), LV_PART_MAIN | LV_STATE_DEFAULT);
+	lv_obj_set_style_bg_opa(ui_plList, 160, LV_PART_MAIN | LV_STATE_DEFAULT);
+	lv_obj_set_style_pad_all(ui_plList, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
 
-	// 禁止列表滚动
-	lv_obj_clear_flag(ui_list1, LV_OBJ_FLAG_SCROLLABLE);
+	plLogMem("打开列表页: 框架就绪");
 
-	// 加载当前页
-	loadPage(currentPage);
-	
-	Serial.printf("播放列表初始化完成，共 %d 页，当前显示第 %d 页\n", totalPages, currentPage + 1);
+	plLoadPage(plPage);
+
+	plLogMem("打开列表页: 列表已填充");
+
+	// 先切到列表页，确认切换完成后再销毁主播放界面（节省内存与刷新开销）
+	// 必须保持「先切换、后删除」：删除活动屏幕会让 lv_scr_act() 变成野指针
+	lv_disp_load_scr(ui_playListScreen);
+	if (ui_Screen1 != nullptr)
+	{
+		// 当前正处于 ui_Screen1 内按钮的回调中，异步删除更安全
+		lv_obj_del_async(ui_Screen1);
+		ui_Screen1 = nullptr;
+	}
+
+	plLogMem("打开列表页: 完成");
 }

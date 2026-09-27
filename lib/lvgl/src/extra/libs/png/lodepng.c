@@ -71,11 +71,18 @@ lodepng source code. Don't forget to remove "static" if you copypaste them
 from here.*/
 
 #ifdef LODEPNG_COMPILE_ALLOCATORS
+#include "esp_heap_caps.h"
+
 static void* lodepng_malloc(size_t size) {
 #ifdef LODEPNG_MAX_ALLOC
   if(size > LODEPNG_MAX_ALLOC) return 0;
 #endif
-  return lv_mem_alloc(size);
+  /* 解码后的 RGBA 位图很大（1000x1000 封面 = 4MB），而 LVGL 内部堆只有几十 KB，
+     因此优先从 PSRAM 分配；小对象仍落到默认堆。free/realloc 用标准函数即可，
+     它们在 ESP-IDF 下能正确处理任意堆区的指针。*/
+  void* p = heap_caps_malloc(size, MALLOC_CAP_SPIRAM);
+  if(p) return p;
+  return malloc(size);
 }
 
 /* NOTE: when realloc returns NULL, it leaves the original memory untouched */
@@ -83,11 +90,11 @@ static void* lodepng_realloc(void* ptr, size_t new_size) {
 #ifdef LODEPNG_MAX_ALLOC
   if(new_size > LODEPNG_MAX_ALLOC) return 0;
 #endif
-  return lv_mem_realloc(ptr, new_size);
+  return realloc(ptr, new_size);
 }
 
 static void lodepng_free(void* ptr) {
-  lv_mem_free(ptr);
+  free(ptr);
 }
 #else /*LODEPNG_COMPILE_ALLOCATORS*/
 /* TODO: support giving additional void* payload to the custom allocators */
