@@ -147,6 +147,36 @@ static uint32_t s_pauseStartMs = 0;        // 本次暂停开始时刻
 static volatile int s_pendingGain = -1;    // 待应用的增益百分比(0~100)，-1 表示无变化
 
 /* ==================================================================
+   【「切歌后没声音」的兜底判据】
+
+   现象：偶尔切一首歌之后，串口显示「开始播放」、进度条也在走，
+   但喇叭完全没声，要再切一次才恢复。
+
+   成因：audioDoLoad() 里 s_generator->begin() 返回 true 只代表
+   「解码器头解析成功、可以开始喂数据了」，**并不代表真的解出了音频帧**。
+   某些文件（尤其是刚切歌时 SD 读取被 TFT 刷屏抢了总线、或文件头之后的
+   第一帧数据异常）会让 begin() 成功、随后每一次 loop() 都直接返回 false。
+   于是就到了 Music_Loop() 里 `if (!ok)` 那条分支：把解码器 stop 掉、
+   s_decRunning=false、s_decEnded=true —— 也就是「这一首结束了」。
+   UI 收到 ended 就按播放模式切下一首……但如果这一首是单曲循环，
+   或者切到的还是同一个坏文件，就会陷入「反复重载却始终没声」。
+
+   与其猜是哪种文件、哪次总线冲突，不如直接观测「有没有真的出过声」：
+   解码器每次成功解出一帧就会往 I2S 写数据，我们用解码帧数是否增长来判断。
+   装载后连续若干轮 loop() 一帧都没解出来，就判定这次装载是哑的，
+   自动重载一次（只重试一次，避免坏文件导致无限循环）。
+   ================================================================== */
+static uint32_t s_loadSilentFrames = 0;    // 本次装载后「连续没解出帧」的轮数
+static bool s_loadRetried = false;         // 本次装载是否已经自动重试过（防止死循环）
+static uint32_t s_loadAudioMs = 0;         // 本次装载累计「已成功解码」的毫秒数（>0 即真的出过声）
+
+/* 当前正在播放的路径，以及「哑火自动重载」用到的中转变量。
+   路径只在解码任务里读写，不需要加锁。 */
+static char s_currentPath[256] = {0};      // 最近一次成功装载的路径
+static char s_reloadPath[256] = {0};       // 待重载的路径
+static volatile bool s_needReload = false; // 是否需要在下一轮重新装载
+
+/* ==================================================================
    UI → 解码任务的命令通道
 
    【为什么不再用「8 深的命令队列」】
@@ -444,6 +474,24 @@ static void audioDoLoad(const char *path)
 
   String fullPath = normalizePath(path);
 
+  /* 【重置「本首是否出过声」的判据】
+     见 s_loadAudioMs / s_loadRetried 的说明。
+
+     ⚠ s_loadRetried 不能在这里无条件清零：
+       「哑火自动重载」走的也是 audioDoLoad()，如果每次进来都把它清掉，
+       一个真正解不出声音的文件就会被无限重载（重载→哑火→再重载…），
+       永远出不来，界面还会一直卡在「正在加载」。
+       所以只有「换了一首不同的歌」才允许重新获得一次重试机会：
+       路径没变（说明就是这次重载本身）时保留原来的重试标记。 */
+  const bool sameTrackAsBefore = (s_currentPath[0] != 0) &&
+                                 (strcmp(s_currentPath, fullPath.c_str()) == 0);
+  s_loadSilentFrames = 0;
+  s_loadAudioMs = 0;
+  if (!sameTrackAsBefore)
+  {
+    s_loadRetried = false;
+  }
+
   /* 记录「接下来这份内嵌歌词属于哪首曲目」，并清掉上一首的残留。
      放在这里（而不是前面清 s_metaTitle 的地方）是因为要用到 fullPath。
      UI 侧靠 s_id3LrcPath 判断歌词是否已经属于当前曲目，见 parseLrcFile()。 */
@@ -551,6 +599,11 @@ static void audioDoLoad(const char *path)
   }
 
   s_decRunning = true;
+  /* 记下当前路径，供「哑火自动重载」使用。
+     必须放在 begin() 成功之后：只有真的装载起来了才值得重载。 */
+  strncpy(s_currentPath, fullPath.c_str(), sizeof(s_currentPath) - 1);
+  s_currentPath[sizeof(s_currentPath) - 1] = 0;
+  s_loadAudioMs = 0; // 从零开始累计这一首解出的音频时长
   Serial.printf("[AUDIO] 开始播放: %s\n", fullPath.c_str());
 }
 
@@ -710,6 +763,21 @@ void Music_Loop()
        · 解码放在最末尾，且只在解码器确实在跑时才做。 */
   bool heavyCmd = drainCommands();
 
+  /* 1.5 「哑火自动重载」：上一轮解码发现这首一帧都没解出来，
+      在这里重新装载一次。放在 drainCommands() 之后，
+      这样用户在此期间手动切了歌的话，新命令会覆盖掉这次重载意图。 */
+  if (!heavyCmd && s_needReload)
+  {
+    s_needReload = false;
+    if (s_reloadPath[0] != 0)
+    {
+      Serial.printf("[AUDIO] 自动重载: %s\n", s_reloadPath);
+      audioDoLoad(s_reloadPath);
+      vTaskDelay(1);
+      return;
+    }
+  }
+
   /* 2. 应用「播放/暂停」意图。
      这一条不走队列，因此不存在「队列满 → 用户按了没反应」的可能。 */
   applyPauseIntent();
@@ -748,9 +816,10 @@ void Music_Loop()
     uint32_t nowMs = millis();
     if (nowMs - s_lastBeatMs >= 1000)
     {
-      Serial.printf("[AUDIO] 解码心跳: loop=%u 次/秒, 剩余栈=%u 字节\n",
-                    (unsigned)s_loopCount,
-                    (unsigned)uxTaskGetStackHighWaterMark(NULL));
+      // 【调试用】每秒打印一次解码心跳和剩余栈空间，方便判断解码任务是否卡死
+      // Serial.printf("[AUDIO] 解码心跳: loop=%u 次/秒, 剩余栈=%u 字节\n",
+      //               (unsigned)s_loopCount,
+      //               (unsigned)uxTaskGetStackHighWaterMark(NULL));
       s_loopCount = 0;
       s_lastBeatMs = nowMs;
     }
@@ -781,10 +850,59 @@ void Music_Loop()
 
     if (!ok)
     {
+      /* 【区分「放完了」和「根本没出声」】
+
+         !ok 有两种完全不同的含义，原来被当成同一种处理，
+         这正是「切歌偶尔没声音」的根源：
+
+         (a) 正常播完 —— 之前已经成功解出过音频帧，只是这次读到了文件尾。
+             → 照旧：停解码器、置 ended，交给 UI 切下一首。
+
+         (b) 一次都没解出来 —— 装载成功了，但从头到尾一帧都没有。
+             这时绝不能当成「放完了」：UI 会以为这首歌正常结束而跳到下一首，
+             用户看到的就是「切歌后没声音、然后又自己跳走了」。
+             → 自动重载一次。重载会重新 open 文件、重新 begin()，
+               能解决绝大多数「首帧读取被总线冲突打断」的情况。
+
+         ⚠ 判据必须是「真的解出过帧」而不是「loop 调过几次」：
+           一首正常的歌至少要出声几百毫秒，我们按「累计出声时长」来判断，
+           比数循环次数可靠得多（循环次数受文件长度影响，几秒的歌也可能很少轮）。 */
+      const bool everProducedAudio = (s_loadAudioMs >= 50);
+
+      if (!everProducedAudio && !s_loadRetried)
+      {
+        s_loadRetried = true; // 只重试一次，坏文件不会造成无限重载
+        Serial.println("[AUDIO] 警告：本次装载没有解出任何音频，疑似哑火，自动重载一次");
+        /* 记下要重播的路径：这里不能直接调用 Music_PlayPath()，
+           因为那是往命令队列里写，而本函数正是在处理命令的调用栈里，
+           会给刚刚清空的槽位塞回一条命令，语义混乱。
+           改为在下一轮 Music_Loop() 里重新装载，见下面的 s_needReload。 */
+        strncpy(s_reloadPath, s_currentPath, sizeof(s_reloadPath) - 1);
+        s_reloadPath[sizeof(s_reloadPath) - 1] = 0;
+        s_needReload = true;
+        s_generator->stop();
+        s_decRunning = false;
+        s_decEnded = false; // 别让 UI 误判成「播放结束」而跳歌
+        return;
+      }
+
+      if (!everProducedAudio)
+      {
+        Serial.println("[AUDIO] 警告：重载后仍然解不出音频，判定为无法解码的文件");
+      }
+
       s_generator->stop();
       s_decRunning = false;
       s_decEnded = true;
       Serial.println("[AUDIO] 曲目播放结束");
+    }
+    else
+    {
+      /* 成功解码了一轮：累计「已经出过声」的时长，供上面区分 (a)/(b)。
+         用累计耗时而不是循环次数：它直接反映「这一首到底响过没有」，
+         不受歌曲长短、单轮解码量的影响。 */
+      s_loadAudioMs += (cost > 0) ? cost : 1;
+      s_loadSilentFrames = 0;
     }
   }
 
@@ -911,6 +1029,40 @@ String Music_BaseName(const String &path)
 {
   int slash = path.lastIndexOf('/');
   return (slash >= 0) ? path.substring(slash + 1) : path;
+}
+
+/* 在播放列表里按路径查下标。
+
+   ⚠ 这里**不能**对每个条目都调一次 normalizePath()：那会为 1000 首歌做
+     2000 次 String 分配（一次拷贝 + 一次 trim），而内部堆本来就只有几 KB，
+     点一下歌就可能因为这一下抖动把后面的 fopen 挤崩（见 lv_conf.h 里的说明）。
+   播放列表里的路径本来就是 entryFullPath()/normalizePath() 规范化后写进去、
+   再原样读回来的，所以直接逐条 strcmp 就是对的，全程只分配 want 这一个 String。
+   另外顺手兼容一下「库里存的是不带前导 '/' 的写法」。 */
+int Music_IndexOfPath(const char *path)
+{
+  if (path == nullptr || path[0] == 0)
+  {
+    return -1;
+  }
+  String want = normalizePath(String(path));
+  const char *wantC = want.c_str();
+  const char *wantNoLead = (wantC[0] == '/') ? (wantC + 1) : wantC;
+  const bool checkNoLead = (wantNoLead != wantC) && (wantNoLead[0] != 0);
+
+  for (int i = 0; i < fileCount; i++)
+  {
+    const char *have = musicFiles[i].c_str();
+    if (strcmp(have, wantC) == 0)
+    {
+      return i;
+    }
+    if (checkNoLead && strcmp(have, wantNoLead) == 0)
+    {
+      return i;
+    }
+  }
+  return -1;
 }
 
 /* ---------- 高效目录枚举 ----------

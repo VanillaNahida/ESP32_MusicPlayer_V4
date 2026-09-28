@@ -56,10 +56,33 @@
 
     /*Set an address for the memory pool instead of allocating it as a normal array. Can be in external SRAM too.*/
     #define LV_MEM_ADR 0     /*0: unused*/
-    /*Instead of an address give a memory allocator that will be called to get a memory pool for LVGL. E.g. my_malloc*/
+
+    /* ── 把 LVGL 的内存池搬到 PSRAM ──
+       原来这 110KB 是以静态数组形式占着**内部** RAM 的（lv_mem.c 里的
+       work_mem_int）。而这块板子的内部 RAM 只有 327KB，播放列表 1023 首
+       又要吃掉 60KB 左右的 String，结果内部堆只剩 8KB 左右。
+
+       内部堆只剩 8KB 会出事：newlib 的 fopen() 需要给新的 FILE 结构体和一个
+       递归锁各分配一小块内存，分配不到就直接 abort() ——
+       现场就是点列表里的歌 → savePlayState() → SD.open() 崩在
+       lock_init_generic()，整个芯片复位。
+       （esp_get_free_heap_size() 把 PSRAM 也算进去了，所以看总数是 8MB 很宽裕，
+        真正紧张的是内部堆，必须单独看 MALLOC_CAP_INTERNAL。）
+
+       PSRAM 有 8MB，放这 110KB 绰绰有余，内部堆立刻从 8KB 变回 ~118KB。
+       heap_caps_malloc_prefer 先试 PSRAM、再退回内部堆：万一碰上没有 PSRAM 的
+       板子，退回内部堆也能成立（池子是在 lv_init() 里申请的，那时播放列表
+       还没加载，内部堆有 160KB 以上）。
+       ⚠ lv_mem.c 对 LV_MEM_POOL_ALLOC 的返回值不做判空（会直接
+         lv_tlsf_create_with_pool(NULL, size)），所以这里必须保证能拿到内存。 */
     #if LV_MEM_ADR == 0
         #undef LV_MEM_POOL_INCLUDE
         #undef LV_MEM_POOL_ALLOC
+        #define LV_MEM_POOL_INCLUDE <esp_heap_caps.h>
+        #define LV_MEM_POOL_ALLOC(size) \
+            heap_caps_malloc_prefer((size), 2, \
+                                    MALLOC_CAP_SPIRAM, \
+                                    MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)
     #endif
 
 #else       /*LV_MEM_CUSTOM*/
@@ -345,7 +368,12 @@
 #define LV_EXPORT_CONST_INT(int_value) struct _silence_gcc_warning /*The default value just prevents GCC warning*/
 
 /*Extend the default -32k..32k coordinate range to -4M..4M by using int32_t for coordinates instead of int16_t*/
-#define LV_USE_LARGE_COORD 0
+/* 打开的原因：播放列表页现在是「一整条可滚动的列表」，滚动范围靠一个
+   高度 = 条数 × 34px 的 spacer 撑出来。int16_t 的坐标上限只有 32767，
+   也就是 963 行就溢出了（会绕成负数，列表滚动直接乱掉）。
+   改成 int32_t 之后上限变成 4M，几千首歌也不会有问题；
+   代价是每个对象多 8 字节坐标，而列表是虚拟化的、屏幕上只有十几个对象。 */
+#define LV_USE_LARGE_COORD 1
 
 /*==================
  *   FONT USAGE

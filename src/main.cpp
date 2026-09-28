@@ -6,6 +6,7 @@
 #include "AudioBusLock.h"
 #include "Touch.h"
 #include "PlaylistTool.h"
+#include "esp_heap_caps.h"
 
 /*函数声明*/
 void UI_update();
@@ -140,7 +141,27 @@ void setup()
   Serial.println(LVGL_Arduino);
   Serial.println("I am LVGL_Arduino");
 
+  /* LVGL 的内存池必须落在 PSRAM，否则它会占掉内部 RAM 的 110KB，
+     而内部堆一旦只剩几 KB，newlib 的 fopen() 分不到 FILE 结构体和递归锁
+     就会直接 abort()（点歌 → savePlayState() → SD.open() 崩在
+     lock_init_generic，整个芯片复位）。这里把「池子到底从哪个堆拿的」
+     打出来，避免以后再靠猜。详见 lv_conf.h 里 LV_MEM_POOL_ALLOC 的说明。 */
+  uint32_t psramBefore = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+  uint32_t internalBefore = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+
   lv_init();
+
+  uint32_t psramAfter = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+  uint32_t internalAfter = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+  Serial.printf("[MEM] LVGL 内存池 %u 字节 -> PSRAM 减少 %u, 内部堆减少 %u | 现在 内部=%u PSRAM=%u\n",
+                (unsigned)LV_MEM_SIZE,
+                (unsigned)(psramBefore - psramAfter),
+                (unsigned)(internalBefore - internalAfter),
+                (unsigned)internalAfter, (unsigned)psramAfter);
+  if ((internalBefore - internalAfter) >= LV_MEM_SIZE / 2)
+  {
+    Serial.println("[MEM] !! 内存池落在了内部 RAM（PSRAM 没拿到），内部堆会很紧张！");
+  }
 
 #if LV_USE_LOG != 0
   lv_log_register_print_cb(my_print); /* register print function for debugging */
@@ -473,6 +494,17 @@ static void UI_HandleTrackChange(void)
     /* 4) 顶栏立刻给出反馈，让用户知道「点到了」 */
     lv_label_set_text(ui_Label2, "正在加载?..");
     Serial.printf("[UI] 切到第 %d 首: %s\n", music_i + 1, musicFiles[music_i].c_str());
+
+    /* 5) 换歌了：作废上一首的封面缓存。
+        必须在这里做，而不是在 Music.cpp 的 audioDoLoad() 里 ——
+        那里跑在解码任务（core0）上，而 s_displayBuf 正被 core1 的 LVGL
+        用来绘制，跨核释放会画出已释放的内存。
+        本函数在 LVGL 线程里执行，且「每换一首歌恰好走一次」，
+        正是释放旧图、让下一首重新解码的正确时机。
+        （封面版本号 revision 本身也会变，所以即使漏了这一步，
+          AlbumArt_Request 也会按 revision 判断而不会显示错图；
+          这里主动释放只是为了及时回收那 72KB，不让它滞留到下一首。） */
+    AlbumArt_Release();
 }
 
 void UI_update()
@@ -494,6 +526,12 @@ void UI_update()
         pause_executed = false;
         shownTitle = "";
         shownArtist = "";
+        /* 注意：这里**不要**把 ui_coverAttemptedRev 清成 0 当作「强制重新解码」。
+           页面重建后 ui_haibao 是一个全新的空控件，确实需要重新把封面挂上去，
+           但「重新挂」不等于「重新解码」——
+           AlbumArt_Request() 内部按 revision 命中缓存，瞬间就能出图。
+           清成 0 只是让 UI_UpdateAlbumArt() 愿意再调一次 Request，是必须的；
+           真正避免重复解码的是 AlbumArt.cpp 里的缓存。 */
         ui_coverAttemptedRev = 0;
         ui_coverShownDefault = false;
         ui_lastShownSec = 0xFFFFFFFF;

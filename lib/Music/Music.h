@@ -120,6 +120,12 @@ String Music_ParentDir(const String &path);
 // 取文件名（含扩展名）
 String Music_BaseName(const String &path);
 
+/* 在播放列表 musicFiles[] 里按完整路径找一首歌，返回下标；找不到返回 -1。
+   文件浏览页允许播放任何文件（包括上次重建之后才拷进卡、还没进播放列表的），
+   所以调用方需要知道「这首歌到底在不在列表里」：在就同步 music_i
+   （上一首/下一首才不会乱跳），不在就只当作一次独立播放。 */
+int Music_IndexOfPath(const char *path);
+
 /* ---------- 高效目录枚举（句柄式，支持增量/跨帧进行）----------
 
    为什么不用 File::openNextFile()：

@@ -41,6 +41,30 @@ static uint32_t s_readyRevision = 0;
 static uint8_t *s_displayBuf = nullptr;       // 当前正被 LVGL 使用的缓冲
 static lv_img_dsc_t s_artDsc;
 
+/* ==================================================================
+   【已解码封面的缓存】
+
+   为什么需要它：封面解码是几百毫秒到数秒的纯 CPU 重活。原来的实现里，
+   只要 UI 重新走一次「请求封面」的流程（典型场景：进列表页再返回播放页，
+   主界面被 ui_Screen1_screen_init() 整个重建），就会重新解码一遍同一张图 ——
+   用户看到的就是「切个页面回来，封面又空白一下再慢慢出来」。
+
+   现在按 revision（封面版本号，换歌才变）缓存解码结果：
+     · revision 没变 → 直接复用 s_cacheBuf，零解码、瞬间出图；
+     · revision 变了   → 才真正重新解码。
+
+   缓存的是**解码后的最终位图**（155x155 RGB565+Alpha ≈ 72KB），
+   放在 PSRAM 里。只缓存当前这一首：换歌时旧图没有任何复用价值，
+   多缓存只会白占内存。
+
+   线程约定：s_cacheBuf / s_cacheRevision 只在下述两处被改动，
+     · DecodeTask 线程：解码成功后写入；
+     · LVGL 线程（AlbumArt_Request / AlbumArt_Release）：换歌时清掉。
+   两者都用 s_artMutex 保护。
+   ================================================================== */
+static uint8_t *s_cacheBuf = nullptr;      // 缓存：已解码好的位图
+static uint32_t s_cacheRevision = 0;       // 上面这张图对应的封面版本（0 = 无缓存）
+
 static uint8_t *s_work = nullptr;             // tjpgd 工作区（仅后台任务使用）
 
 // JPEG 解码上下文
@@ -348,15 +372,41 @@ static void albumArtTask(void *param)
             continue; // 解码失败：保持默认封面
         }
 
-        // 交接给 UI：若已有未被取走的旧结果，直接丢弃（UI 还没换上就走下一首了）
+        /* 交接给 UI，并把结果登记为「当前这一版的缓存」。
+
+           三个指针可能是同一块内存，所以判重一律基于「改动前的快照」：
+             s_readyBuf   —— 解码好了、等 UI 来取的新图（本函数刚产出）
+             s_cacheBuf   —— 同一首歌切页面时复用用的图
+             s_displayBuf —— LVGL 此刻正在画的那张图（core1 在引用！）
+
+           **绝不能释放 s_displayBuf 指向的块** —— 它正被 LVGL 使用，
+           释放了就是画到已释放内存。它会在 AlbumArt_Poll() 取走新图之后，
+           由图源切换完成时才安全释放。 */
         xSemaphoreTake(s_artMutex, portMAX_DELAY);
-        if (s_readyBuf != nullptr)
-        {
-            heap_caps_free(s_readyBuf);
-        }
+
+        uint8_t *const oldReady = s_readyBuf;
+        uint8_t *const oldCache = s_cacheBuf;
+        uint8_t *const displayed = s_displayBuf;
+
+        // 旧值先作废，避免下面释放后仍被当成有效指针使用
+        s_cacheBuf = buf;
+        s_cacheRevision = rev;
         s_readyBuf = buf;
         s_readyRevision = rev;
         xSemaphoreGive(s_artMutex);
+
+        /* 收尾释放（放在锁外，避免长时间持锁）：
+           1) 上一张「解好但没被取走」的图：没人引用 → 放
+           2) 上一版缓存：只要不是在显示的 → 放
+           两块都跳过「正在显示的」和「就是新图本身」的情况。 */
+        if (oldReady != nullptr && oldReady != buf && oldReady != displayed)
+        {
+            heap_caps_free(oldReady);
+        }
+        if (oldCache != nullptr && oldCache != buf && oldCache != displayed)
+        {
+            heap_caps_free(oldCache);
+        }
     }
 }
 
@@ -386,21 +436,127 @@ void AlbumArt_ShowDefault(void)
 
 void AlbumArt_Request(uint32_t revision)
 {
+    /* 【缓存命中：直接复用，不重新解码】
+       revision 是「封面版本号」，只有换歌才会变。所以同一首歌里
+       无论 UI 重建多少次（进列表页再返回、切页面回来……），
+       都走这一条分支：把缓存的位图直接挂到 ui_haibao 上，
+       既不闪默认封面，也不用等几百毫秒。
+
+       这里刻意**不**先调用 AlbumArt_ShowDefault()：
+       缓存命中时用户应该立刻看到原图，先闪一下默认封面反而更难看。 */
+    if (s_artMutex != nullptr)
+    {
+        uint8_t *buf = nullptr;
+        uint8_t *oldDisplay = nullptr;
+        xSemaphoreTake(s_artMutex, portMAX_DELAY);
+        const bool hit = (s_cacheBuf != nullptr && revision != 0 &&
+                          revision == s_cacheRevision);
+        if (hit)
+        {
+            buf = s_cacheBuf;
+            /* 旧的显示缓冲只摘指针、不在这里释放 —— 它此刻仍被 LVGL
+               通过 s_artDsc 引用着，要等下面 lv_img_set_src() 换完图源
+               才能真正回收。放在这里 free 就是「释放正在绘制的内存」。
+               同时排除别名：缓存命中后 s_displayBuf 往往就等于 s_cacheBuf，
+               那种情况根本没有旧图要回收。 */
+            if (s_displayBuf != nullptr && s_displayBuf != buf)
+            {
+                oldDisplay = s_displayBuf;
+            }
+            s_displayBuf = buf;
+        }
+        xSemaphoreGive(s_artMutex);
+
+        if (buf != nullptr)
+        {
+            s_artDsc.header.always_zero = 0;
+            s_artDsc.header.cf = LV_IMG_CF_TRUE_COLOR_ALPHA;
+            s_artDsc.header.reserved = 0;
+            s_artDsc.header.w = ALBUM_ART_BOX;
+            s_artDsc.header.h = ALBUM_ART_BOX;
+            s_artDsc.data_size = ALBUM_ART_BUF_BYTES;
+            s_artDsc.data = buf;
+            lv_img_set_src(ui_haibao, &s_artDsc);
+            lv_obj_set_size(ui_haibao, ALBUM_ART_BOX, ALBUM_ART_BOX);
+            lv_obj_invalidate(ui_haibao);
+            /* 图源已换走，旧图现在没人引用了，可以安全释放 */
+            if (oldDisplay != nullptr)
+            {
+                heap_caps_free(oldDisplay);
+            }
+            return;
+        }
+    }
+
     // 立刻先显示默认封面，解码完成后再替换 —— 保证界面永远不等待封面
+    /* ⚠ 这一句同时也是「释放旧显示图」的安全前提：
+       ui_haibao 的图源在这里被换成内置默认封面，LVGL 从此不再引用
+       旧的那块位图；下面才敢把它 free 掉。
+       顺序反过来（先 free 再 ShowDefault）就会让 LVGL 画到已释放内存。 */
     AlbumArt_ShowDefault();
 
     xSemaphoreTake(s_artMutex, portMAX_DELAY);
-    // 旧的结果已无意义
-    if (s_readyBuf != nullptr)
+    /* ══════════════════════════════════════════════════════════════
+       【换歌：把上一首的图全部作废】
+
+       这里曾经因为「三个指针互相别名、边判断边置空」而 free 了两次，
+       直接踩中 TLSF 的断言：
+           assert failed: tlsf_free tlsf.c:630
+           (!block_is_free(block) && "block already marked as free")
+
+       根因是所有权不清晰：s_readyBuf / s_cacheBuf / s_displayBuf 都可能是
+       同一块内存（解码后 ready==cache，缓存命中后 display==cache），
+       于是任何「先置空 A、再用 A 去判断 B」的写法都会失效。
+
+       现在改成**单向所有权**，规则只有两条：
+         1) 每一块内存同一时刻只被一个变量「拥有」，释放权跟着拥有者走；
+         2) 需要作废时，先把三个槽位整体搬进局部变量并清空全局，
+            再对局部变量按地址去重后释放 —— 绝不基于已改动的全局变量判重。
+       ══════════════════════════════════════════════════════════════ */
+    uint8_t *handles[3] = {s_readyBuf, s_cacheBuf, s_displayBuf};
+    s_readyBuf = nullptr;
+    s_displayBuf = nullptr;
+    /* 缓存只有在「换了一首歌」时才作废（revision 变了）。
+       UI 页面重建会把 ui_coverAttemptedRev 清 0，同一个 revision 会再次
+       调用本函数 —— 那种情况必须保住缓存，否则缓存就白做了。 */
+    const bool keepCache = (revision == s_cacheRevision) && (s_cacheRevision != 0);
+    if (!keepCache)
     {
-        heap_caps_free(s_readyBuf);
-        s_readyBuf = nullptr;
+        s_cacheBuf = nullptr;
+        s_cacheRevision = 0;
     }
-    // 释放上一首正在显示的图（此时 UI 已切回默认封面，不再引用它）
-    if (s_displayBuf != nullptr)
+    else
     {
-        heap_caps_free(s_displayBuf);
-        s_displayBuf = nullptr;
+        /* 保住缓存：把它的句柄从待释放名单里摘掉（去重逻辑不必再特判） */
+        for (int i = 0; i < 3; i++)
+        {
+            if (handles[i] == s_cacheBuf)
+            {
+                handles[i] = nullptr;
+            }
+        }
+    }
+
+    for (int i = 0; i < 3; i++)
+    {
+        uint8_t *p = handles[i];
+        if (p == nullptr)
+        {
+            continue;
+        }
+        bool dup = false;
+        for (int j = 0; j < i; j++)
+        {
+            if (handles[j] == p)
+            {
+                dup = true;
+                break;
+            }
+        }
+        if (!dup)
+        {
+            heap_caps_free(p);
+        }
     }
     xSemaphoreGive(s_artMutex);
 
@@ -416,15 +572,22 @@ bool AlbumArt_Poll(void)
     }
 
     uint8_t *buf = nullptr;
+    uint8_t *oldDisplay = nullptr;
     xSemaphoreTake(s_artMutex, portMAX_DELAY);
     if (s_readyBuf != nullptr)
     {
         buf = s_readyBuf;
         s_readyBuf = nullptr;
-        // 上一张正在显示的图可以释放了（LVGL 下一秒就会引用新图）
-        if (s_displayBuf != nullptr)
+        /* ⚠ 这里**只摘指针、不释放**：旧的显示缓冲此刻可能仍被 LVGL
+           引用着，要等下面 lv_img_set_src() 把图源换成新图之后才能 free。
+           以前在这里就 free 掉了，属于「释放了 LVGL 正在画的内存」。
+           另外还要排除「旧显示缓冲 == 新图」的情况（解码完成后
+           s_readyBuf 与 s_cacheBuf 是同一块，缓存命中时 s_displayBuf
+           又等于它），否则会把马上要显示的新图直接释放掉。 */
+        if (s_displayBuf != nullptr && s_displayBuf != buf &&
+            s_displayBuf != s_cacheBuf)
         {
-            heap_caps_free(s_displayBuf);
+            oldDisplay = s_displayBuf;
         }
         s_displayBuf = buf;
     }
@@ -446,6 +609,12 @@ bool AlbumArt_Poll(void)
     lv_img_set_src(ui_haibao, &s_artDsc);
     lv_obj_set_size(ui_haibao, ALBUM_ART_BOX, ALBUM_ART_BOX);
     lv_obj_invalidate(ui_haibao);
+
+    /* 图源已经换成新图，LVGL 不再引用旧的那块了，现在释放才安全。 */
+    if (oldDisplay != nullptr)
+    {
+        heap_caps_free(oldDisplay);
+    }
     return true;
 }
 
@@ -455,11 +624,50 @@ void AlbumArt_Release(void)
     {
         return;
     }
-    xSemaphoreTake(s_artMutex, portMAX_DELAY);
-    if (s_readyBuf != nullptr)
+
+    /* 【先把 ui_haibao 切回内置默认封面，再回收内存】
+       s_displayBuf 此刻正被 LVGL 通过 s_artDsc 引用着（ui_haibao 的图源）。
+       直接 free 就是「释放正在绘制的内存」—— 表现为花屏或 LoadProhibited。
+       换成内置的 ui_img_haibao_png 之后，那块内存才真正没人引用，可以安全回收。
+       这也是本函数必须由 LVGL 线程（UI_HandleTrackChange）调用的原因：
+       换图源和回收必须在同一个线程里成对完成。 */
+    if (ui_haibao != nullptr)
     {
-        heap_caps_free(s_readyBuf);
-        s_readyBuf = nullptr;
+        lv_img_set_src(ui_haibao, &ui_img_haibao_png);
+        lv_obj_set_size(ui_haibao, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+        lv_obj_invalidate(ui_haibao);
+    }
+
+    xSemaphoreTake(s_artMutex, portMAX_DELAY);
+    /* 换歌时三块内存全部作废。它们可能是同一块（别名），
+       所以先整体搬到局部数组、清空全局，再按地址去重后各释放一次 ——
+       绝不基于「已经被改动的全局变量」去判重（那样会 double free）。 */
+    uint8_t *toBeFreed[3] = {s_readyBuf, s_cacheBuf, s_displayBuf};
+    s_readyBuf = nullptr;
+    s_cacheBuf = nullptr;
+    s_displayBuf = nullptr;
+    s_cacheRevision = 0;
+
+    for (int i = 0; i < 3; i++)
+    {
+        uint8_t *p = toBeFreed[i];
+        if (p == nullptr)
+        {
+            continue;
+        }
+        bool dup = false;
+        for (int j = 0; j < i; j++)
+        {
+            if (toBeFreed[j] == p)
+            {
+                dup = true;
+                break;
+            }
+        }
+        if (!dup)
+        {
+            heap_caps_free(p);
+        }
     }
     xSemaphoreGive(s_artMutex);
     s_reqPending = false;

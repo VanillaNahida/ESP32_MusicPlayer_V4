@@ -351,8 +351,9 @@ void Touch_Read(lv_indev_drv_t *drv, lv_indev_data_t *data)
         s_dbgPrevPr = pr;
         s_dbgPrevX = sx;
         s_dbgPrevY = sy;
-        Serial.printf("[TOUCH] raw=(%d,%d) z=%d -> 屏幕 (%d,%d) state=PR\n",
-                      (int)rawX, (int)rawY, (int)rawZ, (int)sx, (int)sy);
+        // 调试用
+        // Serial.printf("[TOUCH] raw=(%d,%d) z=%d -> 屏幕 (%d,%d) state=PR\n",
+        //               (int)rawX, (int)rawY, (int)rawZ, (int)sx, (int)sy);
     }
 }
 
