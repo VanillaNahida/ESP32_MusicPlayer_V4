@@ -12,6 +12,8 @@
 #include "esp_heap_caps.h"
 #include "freertos/semphr.h"
 #include <vector>
+#include <dirent.h>
+#include <sys/stat.h>
 
 // SD引脚定义
 #define SD_Pin 38
@@ -811,30 +813,24 @@ static String entryFullPath(const String &dir, const String &name)
   return normalizePath(dir + "/" + name);
 }
 
-/* 阻塞式全卡递归扫描（开机自动建表、以及放弃重建后的兜底用）。
+/* 阻塞式全卡递归扫描（目前没有调用者，保留作为「一次性、可阻塞」的参考实现）。
    注意：所有 SD 访问都包在 SPI 总线锁里 —— TFT 刷屏和它共用同一条总线，
    运行期（LVGL 已经在刷屏）不加锁会直接把 SPI 事务打乱。
-   想要带进度的非阻塞版本请用 Music_RescanBegin/Step/End。 */
+   想要带进度的非阻塞版本请用 Music_RescanBegin/Step/End。
+   内部改用 Music_OpenDir/ReadDir/CloseDir（它们自带总线锁，不能在外面再套一层，
+   因为 AudioBusLock 用的是不可重入的普通互斥量）。 */
 void scanAndAddMusicFiles(String dir)
 {
-  AudioBusLock();
-  File root = SD.open(dir);
-  AudioBusUnlock();
-  if (!root)
+  void *d = Music_OpenDir(dir.c_str());
+  if (d == nullptr)
   {
     return;
   }
 
-  while (true)
+  String name;
+  bool isDir = false;
+  while (Music_ReadDir(d, name, isDir))
   {
-    AudioBusLock();
-    File file = root.openNextFile();
-    String name = file ? file.name() : String("");
-    bool isDir = file ? file.isDirectory() : false;
-    AudioBusUnlock();
-    if (!file)
-      break;
-
     if (isDir)
     {
       scanAndAddMusicFiles(entryFullPath(dir, name)); // 递归处理子目录
@@ -843,15 +839,9 @@ void scanAndAddMusicFiles(String dir)
     {
       addMusicFile(entryFullPath(dir, name));
     }
-
-    AudioBusLock();
-    file.close();
-    AudioBusUnlock();
   }
 
-  AudioBusLock();
-  root.close();
-  AudioBusUnlock();
+  Music_CloseDir(d);
 }
 
 // 重写 listMusicFiles 为完整实现
@@ -897,6 +887,110 @@ bool isMusicFile(String name)
   base.toLowerCase();
   return base.endsWith(".mp3") || base.endsWith(".flac") ||
          base.endsWith(".wav") || base.endsWith(".aac");
+}
+
+/* ================= 供「文件浏览页」使用的路径/目录工具 =================
+
+   这些放在 lib/Music 里而不是 UI 里，是因为它们都要碰 SD 卡，
+   而 SD 访问必须走 SPI 总线锁（和 TFT 刷屏互斥）。把这件事关在一个地方，
+   UI 侧就只需要关心控件，不用再去记「读卡要加锁」。 */
+
+// 取父目录：".../a/b/c.mp3" -> ".../a/b"；根目录再往上仍然是 "/"
+String Music_ParentDir(const String &path)
+{
+  int slash = path.lastIndexOf('/');
+  if (slash <= 0)
+  {
+    return String("/"); // 已经是根，或者没有目录部分
+  }
+  return path.substring(0, slash);
+}
+
+// 取文件名（含扩展名）：".../a/b/c.mp3" -> "c.mp3"
+String Music_BaseName(const String &path)
+{
+  int slash = path.lastIndexOf('/');
+  return (slash >= 0) ? path.substring(slash + 1) : path;
+}
+
+/* ---------- 高效目录枚举 ----------
+   背景说明见 Music.h：绕开 File::openNextFile() 是为了避开它对每个条目
+   做一次按路径 stat() 带来的 O(n²)。 */
+
+// 把 "/洛雪下载" 这样的相对路径拼成 VFS 绝对路径（SD 默认挂在 "/sd"）
+static String musicVfsPath(const char *dir)
+{
+  const char *mp = SD.mountpoint();
+  String base = (mp != nullptr && mp[0] != 0) ? String(mp) : String("/sd");
+  if (dir == nullptr || dir[0] == 0 || strcmp(dir, "/") == 0)
+  {
+    return base;
+  }
+  if (dir[0] == '/')
+  {
+    return base + dir;
+  }
+  return base + "/" + dir;
+}
+
+void *Music_OpenDir(const char *dir)
+{
+  String full = musicVfsPath(dir);
+  AudioBusLock();
+  DIR *d = opendir(full.c_str());
+  AudioBusUnlock();
+  if (d == nullptr)
+  {
+    Serial.printf("[DIR] 打不开目录: %s\n", dir ? dir : "(null)");
+  }
+  return d;
+}
+
+bool Music_ReadDir(void *handle, String &nameOut, bool &isDirOut)
+{
+  if (handle == nullptr)
+  {
+    return false;
+  }
+  DIR *d = (DIR *)handle;
+
+  AudioBusLock();
+  struct dirent *e = readdir(d);
+  String name;
+  bool isDir = false;
+  if (e != nullptr)
+  {
+    name = e->d_name;
+    /* d_type 由 ESP-IDF 的 FATFS VFS 填好（框架自己的 openNextFile()
+       也正是靠它区分 DT_REG / DT_DIR，不认识就跳过），所以这里直接信它，
+       不再为每个条目补一次 stat() —— 那正是我们要躲开的开销。 */
+    isDir = (e->d_type == DT_DIR);
+  }
+  AudioBusUnlock();
+
+  if (e == nullptr)
+  {
+    return false;
+  }
+  if (name == "." || name == ".." || name.startsWith("."))
+  {
+    return Music_ReadDir(handle, nameOut, isDirOut); // 跳过隐藏项/自身
+  }
+
+  nameOut = name;
+  isDirOut = isDir;
+  return true;
+}
+
+void Music_CloseDir(void *handle)
+{
+  if (handle == nullptr)
+  {
+    return;
+  }
+  AudioBusLock();
+  closedir((DIR *)handle);
+  AudioBusUnlock();
 }
 
 /* 解析一段 LRC 文本到 lyrics[]。
@@ -1865,7 +1959,13 @@ static ScanPhase s_scanPhase = SCAN_IDLE;
 static bool s_scanSaveOk = false;
 static bool s_scanTruncated = false;
 static std::vector<String> *s_scanPending = nullptr;
-static File s_scanDirHandle;
+/* 目录句柄用 opendir 的 DIR*（Music_OpenDir 返回的 void*），不再用 File：
+   File::openNextFile() 每取一个条目都会按完整路径 stat() 一次，而 FATFS 的
+   按路径查找得从目录头扫起 —— 277 首的目录就是 3.8 万次目录项扫描，
+   扫描进度条看着像卡死。readdir 自带 d_type，一次顺序扫描全拿到。
+   注意：Music_OpenDir/ReadDir/CloseDir 内部已经加了 SPI 总线锁，
+   而 AudioBusLock 是普通互斥量（不可重入），这里绝不能再套一层锁。 */
+static void *s_scanDirHandle = nullptr;
 static bool s_scanDirOpen = false;
 static String s_scanCurDir;
 static int s_scanDirsDone = 0;
@@ -1896,9 +1996,8 @@ void Music_RescanBegin()
   // 0) 防御：万一上一次扫描是被异常路径打断的，这里先把目录句柄收干净
   if (s_scanDirOpen)
   {
-    AudioBusLock();
-    s_scanDirHandle.close();
-    AudioBusUnlock();
+    Music_CloseDir(s_scanDirHandle);
+    s_scanDirHandle = nullptr;
     s_scanDirOpen = false;
   }
 
@@ -1989,12 +2088,10 @@ bool Music_RescanStep(uint32_t budgetMs)
         s_scanCurDir = s_scanPending->back();
         s_scanPending->pop_back();
 
-        AudioBusLock();
-        s_scanDirHandle = SD.open(s_scanCurDir);
-        AudioBusUnlock();
+        s_scanDirHandle = Music_OpenDir(s_scanCurDir.c_str());
 
         s_scanDirsDone++;
-        if (!s_scanDirHandle)
+        if (s_scanDirHandle == nullptr)
         {
           scanUpdatePct((int)((int64_t)s_scanDirsDone * 100 /
                               (s_scanDirsDone + (int)s_scanPending->size() + 1)));
@@ -2007,24 +2104,15 @@ bool Music_RescanStep(uint32_t budgetMs)
         continue;
       }
 
-      // 取一个目录项（openNextFile / isDirectory 都会真正读卡，必须持锁）
-      AudioBusLock();
-      File entry = s_scanDirHandle.openNextFile();
+      // 取一个目录项（readdir 只做一次顺序扫描，不按路径 stat）
       String name;
       bool isDir = false;
-      bool valid = (bool)entry;
-      if (valid)
-      {
-        name = entry.name();
-        isDir = entry.isDirectory();
-      }
-      AudioBusUnlock();
+      bool valid = Music_ReadDir(s_scanDirHandle, name, isDir);
 
       if (!valid)
       {
-        AudioBusLock();
-        s_scanDirHandle.close();
-        AudioBusUnlock();
+        Music_CloseDir(s_scanDirHandle);
+        s_scanDirHandle = nullptr;
         s_scanDirOpen = false;
         continue;
       }
@@ -2050,10 +2138,6 @@ bool Music_RescanStep(uint32_t budgetMs)
           s_scanFound++;
         }
       }
-
-      AudioBusLock();
-      entry.close();
-      AudioBusUnlock();
       continue;
     }
 
@@ -2094,9 +2178,8 @@ bool Music_RescanEnd()
   }
   if (s_scanDirOpen)
   {
-    AudioBusLock();
-    s_scanDirHandle.close();
-    AudioBusUnlock();
+    Music_CloseDir(s_scanDirHandle);
+    s_scanDirHandle = nullptr;
     s_scanDirOpen = false;
   }
 
@@ -2132,9 +2215,8 @@ void Music_RescanAbort()
 {
   if (s_scanDirOpen)
   {
-    AudioBusLock();
-    s_scanDirHandle.close();
-    AudioBusUnlock();
+    Music_CloseDir(s_scanDirHandle);
+    s_scanDirHandle = nullptr;
     s_scanDirOpen = false;
   }
   if (s_scanPending != nullptr)

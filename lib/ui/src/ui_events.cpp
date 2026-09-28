@@ -6,6 +6,8 @@
 #include "ui.h"
 #include <Music.h>
 #include "freertos/task.h"
+#include <vector>
+#include <algorithm>
 
 // 播放列表页面涉及「新建一整套界面」的重操作，这里打印 LVGL 内存池与任务栈余量，
 // 用于区分「内存耗尽」与「死锁/卡住」两类故障。
@@ -24,16 +26,99 @@ static void plLogMem(const char *tag)
 static void plClose(lv_event_t *e);
 static void plPrevPage(lv_event_t *e);
 static void plNextPage(lv_event_t *e);
-static void plPlayItem(lv_event_t *e);
+static void plActivate(lv_event_t *e);
 
-// 播放列表页（独立 screen，打开时销毁主播放界面以节省资源）
+/*==================== 播放列表页 / 文件浏览页 ====================
+
+   同一个 screen，两种模式，分别由两个入口打开：
+
+     右上角菜单图标 → PL_MODE_FLAT   全部歌曲平铺（原来的播放列表页）
+     左上角返回图标 → PL_MODE_BROWSE 文件浏览：目录 + 歌曲
+
+   平铺模式：
+       列表就是 musicFiles[] 本身，按页取下标，**不额外存任何东西**。
+
+   浏览模式：
+       < ..            回上一级（根目录下不显示）
+       > 文件夹名/      子目录，点进去继续浏览
+       歌曲名           点击即播放，并返回播放界面
+
+   ── 这一版重点解决了「进目录会卡死」──
+
+   卡死的真凶不是列表项多，而是 File::openNextFile()：
+   它内部会 new 一个 VFSFileImpl，而那个构造函数对**每一个条目**做一次
+   按完整路径的 stat()。FATFS 的按路径查找是从目录开头逐条扫的，
+   于是遍历 n 个条目变成 O(n²) —— 一个 277 首的目录要做约 3.8 万次
+   目录项扫描，界面就在这一步冻住好几秒。
+
+   所以这里做了两件事：
+     1) 改用 opendir/readdir（见 Music_OpenDir/ReadDir）：readdir 返回的
+        struct dirent 自带 d_type，「名字」和「是不是目录」一次顺序扫描全拿到，
+        复杂度回到 O(n)；
+     2) 即便这样，枚举仍然**分帧进行**（lv_timer 每 20ms 看几十个条目），
+        期间列表显示「正在读取目录…」。这样无论卡多大、多慢，
+        主循环都不会被一个目录卡住 —— 卡读不出来的话界面照样能点、能退出。
+
+   另外：歌曲一律从播放列表 musicFiles[]（已在内存里）筛，不读卡；
+   只有「子目录名」需要读卡，而且用 std::vector 按需增长，
+   没有任何写死的大数组。
+   =============================================================== */
+
+enum PlMode : uint8_t
+{
+	PL_MODE_FLAT = 0, // 全部歌曲平铺
+	PL_MODE_BROWSE    // 文件浏览
+};
+
+// plEntry.fileIndex 的取值含义（仅浏览模式用）
+#define PL_IDX_PARENT (-2) // 上一级目录
+#define PL_IDX_FOLDER (-1) // 子目录
+// >= 0 ：musicFiles[] 的下标（可播放的歌曲）
+
+struct PlEntry
+{
+	String name;       // 显示名（目录名，或歌曲去掉路径与扩展名后的名字）
+	int32_t fileIndex; // 见上面三个常量
+};
+
+/* 每页条目数。
+   算过再定的：主题给 lv_list 行的是 PAD_SMALL，在 240x320 这种小屏上
+   PAD_SMALL = 10px，一行是 15(字高) + 2*10(内边距) + 1(边框) = 36px，
+   一屏 276px 只放得下 7 行，翻页要按到手软。所以下面把行的上下内边距
+   压到 2px，一行变 20px，276/20 = 13 行正好铺满一屏，
+   既不出现「藏在下面看不见的行」，20px 对这块屏也够点。 */
+#define PL_ITEMS_PER_PAGE 13
+#define PL_ROW_PAD_VER 2
+
+// 增量枚举：每次 lv_timer 回调最多处理多少个目录项
+#define PL_ENTRIES_PER_TICK 48
+#define PL_SCAN_PERIOD_MS 20
+// 兜底上限，防止异常目录结构把内存/时间吃光
+#define PL_MAX_SCAN_ENTRIES 2000
+#define PL_MAX_FOLDERS 128
+#define PL_MAX_ENTRIES 800
+
+// 文件浏览页（独立 screen，打开时销毁主播放界面以节省内存）
 static lv_obj_t *ui_playListScreen = nullptr;
-static lv_obj_t *ui_plList = nullptr;      // 曲目列表
+static lv_obj_t *ui_plList = nullptr;      // 条目列表
 static lv_obj_t *ui_plPageLabel = nullptr; // 页码信息
+static lv_obj_t *ui_plPathLabel = nullptr; // 当前目录路径 / 模式标题
 
-const int ITEMS_PER_PAGE = 20; // 每页显示 20 首
-static int plPage = 0;         // 当前页码（从 0 开始）
-static int plTotalPages = 0;   // 总页数
+static PlMode plMode = PL_MODE_FLAT;
+static String plCurrentDir = "/";       // 浏览模式：当前目录
+static std::vector<PlEntry> plEntries;  // 浏览模式：当前目录条目（已排序）
+static int plPage = 0;                  // 当前页码（从 0 开始）
+static int plTotalPages = 1;            // 总页数
+
+/* ---- 增量目录枚举的状态 ----
+   只保存"正在进行的这一次扫描"，不预分配任何大数组：
+   子目录名放在 std::vector 里按需增长。 */
+static lv_timer_t *plScanTimer = nullptr;     // 扫描进行中时非空
+static void *plScanHandle = nullptr;          // Music_OpenDir 的句柄
+static std::vector<String> plScanFolders;     // 已收集到的子目录名
+static String plScanDir;                      // 正在扫描哪个目录
+static int plScanExamined = 0;                // 已查看的目录项数
+static bool plScanTruncated = false;          // 是否触顶截断
 
 void PauseClicke(lv_event_t *e)
 {
@@ -57,7 +142,6 @@ void NextClicke(lv_event_t *e)
 	Music_Next();
 	if (pause_status) // 如果处于暂停状态，还保存暂停状态，只更新曲目信息
 	{
-		Music_Pause();
 		String fileName = musicFiles[music_i];
 		// 去掉路径，只保留文件名
 		int lastSlash = fileName.lastIndexOf("/");
@@ -116,7 +200,6 @@ void VolumeClicked(lv_event_t *e)
 
 void VolumeValueChange(lv_event_t *e)
 {
-	// 1. 获取事件目标对象（滑块）
 	lv_obj_t *slider = lv_event_get_target(e);
 
 	// 2. 获取当前滑块值
@@ -149,7 +232,7 @@ void PrevClicked(lv_event_t *e)
 	}
 }
 
-/*==================== 播放列表页 ====================*/
+/*==================== 列表/浏览页实现 ====================*/
 
 // 取文件名（去掉路径与扩展名）用于列表显示
 static String plDisplayName(const String &path)
@@ -168,12 +251,68 @@ static String plDisplayName(const String &path)
 	return name;
 }
 
+// 排序用的"类别"：0=上级 1=子目录 2=歌曲
+static int plRank(const PlEntry &x)
+{
+	if (x.fileIndex == PL_IDX_PARENT)
+	{
+		return 0;
+	}
+	return (x.fileIndex < 0) ? 1 : 2;
+}
+
+// 往列表里加一行。返回创建出来的行对象。
+static lv_obj_t *plAddRow(const char *text, uint32_t colorHex, size_t userData)
+{
+	lv_obj_t *btn = lv_list_add_btn(ui_plList, NULL, text);
+	lv_obj_set_style_text_font(btn, &ui_font_AlibabaPuHuiTi_12, LV_PART_MAIN | LV_STATE_DEFAULT);
+	lv_obj_set_style_text_align(btn, LV_TEXT_ALIGN_LEFT, LV_PART_MAIN);
+	lv_obj_set_style_bg_opa(btn, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+	// 压扁行高，让整页正好铺满一屏（见 PL_ITEMS_PER_PAGE 的计算）
+	lv_obj_set_style_pad_top(btn, PL_ROW_PAD_VER, LV_PART_MAIN | LV_STATE_DEFAULT);
+	lv_obj_set_style_pad_bottom(btn, PL_ROW_PAD_VER, LV_PART_MAIN | LV_STATE_DEFAULT);
+	lv_obj_set_style_text_color(btn, lv_color_hex(colorHex), LV_PART_MAIN | LV_STATE_DEFAULT);
+	lv_obj_set_user_data(btn, (void *)userData);
+	lv_obj_add_event_cb(btn, plActivate, LV_EVENT_CLICKED, NULL);
+	return btn;
+}
+
+// 加一行不可点的提示文字（空目录 / 正在读取）
+static void plAddHint(const char *text)
+{
+	lv_obj_t *hint = plAddRow(text, 0x8FB8CE, 0);
+	lv_obj_clear_flag(hint, LV_OBJ_FLAG_CLICKABLE);
+}
+
+static void plUpdateCaption(void)
+{
+	if (ui_plPageLabel != nullptr)
+	{
+		lv_label_set_text_fmt(ui_plPageLabel, "第%d/%d页", plPage + 1, plTotalPages);
+	}
+	if (ui_plPathLabel != nullptr)
+	{
+		if (plMode == PL_MODE_FLAT)
+		{
+			lv_label_set_text_fmt(ui_plPathLabel, "全部歌曲（共 %d 首）", fileCount);
+		}
+		else
+		{
+			lv_label_set_text(ui_plPathLabel, plCurrentDir.c_str());
+		}
+	}
+}
+
 // 加载指定页
 static void plLoadPage(int page)
 {
-	if (ui_plList == nullptr || plTotalPages <= 0)
+	if (ui_plList == nullptr)
 	{
 		return;
+	}
+	if (plTotalPages < 1)
+	{
+		plTotalPages = 1;
 	}
 	if (page < 0)
 	{
@@ -187,37 +326,88 @@ static void plLoadPage(int page)
 
 	lv_obj_clean(ui_plList);
 
-	int startIndex = page * ITEMS_PER_PAGE;
-	int endIndex = startIndex + ITEMS_PER_PAGE;
-	if (endIndex > fileCount)
+	if (plMode == PL_MODE_FLAT)
 	{
-		endIndex = fileCount;
+		/* 平铺模式：直接从 musicFiles[] 按页取，不额外存任何东西。
+		   user_data 存的就是 musicFiles 下标，plActivate 里按模式解释。 */
+		if (fileCount <= 0)
+		{
+			plAddHint("（播放列表是空的，按 BOOT 键重建）");
+		}
+		else
+		{
+			int start = page * PL_ITEMS_PER_PAGE;
+			int end = start + PL_ITEMS_PER_PAGE;
+			if (end > fileCount)
+			{
+				end = fileCount;
+			}
+			for (int i = start; i < end; i++)
+			{
+				String text = plDisplayName(musicFiles[i]);
+				plAddRow(text.c_str(), (i == music_i) ? 0xFF4040 : 0xFFFFFF, (size_t)i);
+			}
+		}
+		plUpdateCaption();
+		return;
 	}
 
-	for (int i = startIndex; i < endIndex; i++)
+	/* 浏览模式：从 plEntries 取 */
+	const int total = (int)plEntries.size();
+	int start = page * PL_ITEMS_PER_PAGE;
+	int end = start + PL_ITEMS_PER_PAGE;
+	if (end > total)
 	{
-		lv_obj_t *btn = lv_list_add_btn(ui_plList, NULL, plDisplayName(musicFiles[i]).c_str());
-		lv_obj_set_style_text_font(btn, &ui_font_AlibabaPuHuiTi_12, LV_PART_MAIN | LV_STATE_DEFAULT);
-		lv_obj_set_style_text_align(btn, LV_TEXT_ALIGN_LEFT, LV_PART_MAIN);
-		lv_obj_set_style_bg_opa(btn, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-		// 高亮当前播放曲目
-		lv_obj_set_style_text_color(btn, lv_color_hex(i == music_i ? 0xFF4040 : 0xFFFFFF),
-									LV_PART_MAIN | LV_STATE_DEFAULT);
-		lv_obj_set_user_data(btn, (void *)(size_t)i);
-		lv_obj_add_event_cb(btn, plPlayItem, LV_EVENT_CLICKED, NULL);
+		end = total;
 	}
 
-	if (ui_plPageLabel != nullptr)
+	if (total == 0)
 	{
-		lv_label_set_text_fmt(ui_plPageLabel, "第%d/%d页", plPage + 1, plTotalPages);
+		plAddHint("（这里没有子目录或歌曲）");
+	}
+	else
+	{
+		for (int i = start; i < end; i++)
+		{
+			const PlEntry &it = plEntries[i];
+
+			// 目录用 "> 名字/" 标识，和歌曲一眼能分开
+			String text;
+			uint32_t col;
+			if (it.fileIndex == PL_IDX_PARENT)
+			{
+				text = "< ..";
+				col = 0x7FD4FF;
+			}
+			else if (it.fileIndex == PL_IDX_FOLDER)
+			{
+				text = "> " + it.name + "/";
+				col = 0x7FD4FF;
+			}
+			else
+			{
+				text = it.name;
+				col = (it.fileIndex == music_i) ? 0xFF4040 : 0xFFFFFF;
+			}
+
+			// 浏览模式下 user_data 存的是 plEntries 下标
+			plAddRow(text.c_str(), col, (size_t)i);
+		}
 	}
 
-	Serial.printf("播放列表：第 %d/%d 页\n", plPage + 1, plTotalPages);
+	plUpdateCaption();
+	Serial.printf("浏览: %s  第 %d/%d 页, 共 %d 项%s\n",
+				  plCurrentDir.c_str(), plPage + 1, plTotalPages, total,
+				  plScanTruncated ? "（已达上限，部分内容未列出）" : "");
 }
 
 // 上一页
 static void plPrevPage(lv_event_t *e)
 {
+	if (plScanTimer != nullptr)
+	{
+		return; // 正在读目录，翻页先不管
+	}
 	if (plPage > 0)
 	{
 		plLoadPage(plPage - 1);
@@ -227,28 +417,241 @@ static void plPrevPage(lv_event_t *e)
 // 下一页
 static void plNextPage(lv_event_t *e)
 {
+	if (plScanTimer != nullptr)
+	{
+		return;
+	}
 	if (plPage < plTotalPages - 1)
 	{
 		plLoadPage(plPage + 1);
 	}
 }
 
-// 点击曲目：切歌并返回主播放界面
-static void plPlayItem(lv_event_t *e)
+/* ---------- 增量目录枚举（跨帧进行，绝不长时间占用主循环）---------- */
+
+static void plScanFinish(void);
+
+// 停掉正在进行的扫描并释放句柄（不改变界面）
+static void plScanAbort(void)
+{
+	if (plScanTimer != nullptr)
+	{
+		lv_timer_del(plScanTimer);
+		plScanTimer = nullptr;
+	}
+	if (plScanHandle != nullptr)
+	{
+		Music_CloseDir(plScanHandle);
+		plScanHandle = nullptr;
+	}
+}
+
+// 一次 lv_timer 回调：只看有限个目录项，看完就返回
+static void plScanTick(lv_timer_t *t)
+{
+	int processed = 0;
+	while (processed < PL_ENTRIES_PER_TICK)
+	{
+		String name;
+		bool isDir = false;
+		if (!Music_ReadDir(plScanHandle, name, isDir))
+		{
+			plScanFinish(); // 读完了
+			return;
+		}
+		plScanExamined++;
+		processed++;
+
+		if (isDir)
+		{
+			if ((int)plScanFolders.size() < PL_MAX_FOLDERS)
+			{
+				plScanFolders.push_back(name);
+			}
+			else
+			{
+				plScanTruncated = true;
+			}
+		}
+
+		if (plScanExamined >= PL_MAX_SCAN_ENTRIES)
+		{
+			plScanTruncated = true;
+			plScanFinish();
+			return;
+		}
+	}
+
+	// 还没读完：把进度显示出来，让用户知道在干活
+	if (ui_plList != nullptr && lv_obj_get_child_cnt(ui_plList) > 0)
+	{
+		lv_obj_t *first = lv_obj_get_child(ui_plList, 0);
+		if (first != nullptr)
+		{
+			lv_label_set_text_fmt(lv_obj_get_child(first, 0), "正在读取目录… %d 项", plScanExamined);
+		}
+	}
+}
+
+// 扫描结束：把子目录并进条目表、排序、分页、显示第一页
+static void plScanFinish(void)
+{
+	plScanAbort();
+
+	for (size_t i = 0; i < plScanFolders.size(); i++)
+	{
+		if ((int)plEntries.size() >= PL_MAX_ENTRIES)
+		{
+			plScanTruncated = true;
+			break;
+		}
+		PlEntry e;
+		e.name = plScanFolders[i];
+		e.fileIndex = PL_IDX_FOLDER;
+		plEntries.push_back(e);
+	}
+	plScanFolders.clear();
+
+	// 排序：上级 → 子目录 → 歌曲，同类按名字
+	std::sort(plEntries.begin(), plEntries.end(), [](const PlEntry &a, const PlEntry &b) {
+		int ra = plRank(a);
+		int rb = plRank(b);
+		if (ra != rb)
+		{
+			return ra < rb;
+		}
+		return a.name < b.name;
+	});
+
+	plTotalPages = ((int)plEntries.size() + PL_ITEMS_PER_PAGE - 1) / PL_ITEMS_PER_PAGE;
+	if (plTotalPages < 1)
+	{
+		plTotalPages = 1;
+	}
+	plLoadPage(0);
+}
+
+// 打开某个目录（浏览模式）
+static void plOpenDir(const String &dir)
+{
+	String d = dir;
+	if (d.length() == 0)
+	{
+		d = "/";
+	}
+	// 去掉结尾多余的 '/'（根目录除外），保证和 musicFiles[] 里的写法一致
+	// —— 否则 "/a/b" 和 "/a/b/" 会被当成两个目录，一首歌都筛不出来
+	while (d.length() > 1 && d.endsWith("/"))
+	{
+		d = d.substring(0, d.length() - 1);
+	}
+
+	plScanAbort(); // 上一次没读完的目录先放弃
+
+	plCurrentDir = d;
+	plEntries.clear();
+	plScanFolders.clear();
+	plScanExamined = 0;
+	plScanTruncated = false;
+
+	// 1) 上级目录（根目录下没有上级）
+	if (plCurrentDir != "/")
+	{
+		PlEntry up;
+		up.name = "..";
+		up.fileIndex = PL_IDX_PARENT;
+		plEntries.push_back(up);
+	}
+
+	// 2) 本目录下的歌曲：从播放列表筛。纯内存操作、不读卡，瞬间完成，
+	//    所以哪怕后面读目录还在慢慢进行，用户也已经能看到歌曲了。
+	for (int i = 0; i < fileCount; i++)
+	{
+		if (Music_ParentDir(musicFiles[i]) != plCurrentDir)
+		{
+			continue;
+		}
+		if ((int)plEntries.size() >= PL_MAX_ENTRIES)
+		{
+			plScanTruncated = true;
+			break;
+		}
+		PlEntry e;
+		e.name = plDisplayName(musicFiles[i]);
+		e.fileIndex = i;
+		plEntries.push_back(e);
+	}
+
+	// 3) 子目录：开一个句柄，交给 lv_timer 分帧读
+	plScanHandle = Music_OpenDir(plCurrentDir.c_str());
+	if (plScanHandle == nullptr)
+	{
+		plScanFinish(); // 打不开就当作没有子目录
+		return;
+	}
+
+	if (ui_plList != nullptr)
+	{
+		lv_obj_clean(ui_plList);
+		plAddHint("正在读取目录…");
+		plUpdateCaption();
+	}
+
+	plScanTimer = lv_timer_create(plScanTick, PL_SCAN_PERIOD_MS, NULL);
+}
+
+// 点击条目：目录就进去，歌曲就播放
+static void plActivate(lv_event_t *e)
 {
 	lv_obj_t *obj = lv_event_get_target(e);
-	size_t index = (size_t)lv_obj_get_user_data(obj);
-	if (index >= (size_t)fileCount)
+	size_t idx = (size_t)lv_obj_get_user_data(obj);
+
+	int index = -1;
+	if (plMode == PL_MODE_FLAT)
+	{
+		// 平铺模式：user_data 直接就是 musicFiles 下标
+		index = (int)idx;
+	}
+	else
+	{
+		if (idx >= plEntries.size())
+		{
+			return;
+		}
+		// 必须拷贝一份：下面会重建列表，引用会失效
+		const PlEntry it = plEntries[idx];
+
+		if (it.fileIndex == PL_IDX_PARENT)
+		{
+			plOpenDir(Music_ParentDir(plCurrentDir));
+			return;
+		}
+		if (it.fileIndex == PL_IDX_FOLDER)
+		{
+			String next = plCurrentDir;
+			if (!next.endsWith("/"))
+			{
+				next += "/";
+			}
+			next += it.name;
+			plOpenDir(next);
+			return;
+		}
+		index = (int)it.fileIndex;
+	}
+
+	if (index < 0 || index >= fileCount)
 	{
 		return;
 	}
 
+	// 歌曲：切歌，然后回到播放界面
 	music_prev_i = music_i;
-	music_i = (int)index;
+	music_i = index;
 	Music_PlayPath(musicFiles[index].c_str());
 	savePlayState();
 	pause_status = 0; // 手动暂停标志位取消
-	// 列表选曲是明确的「我要听这首」动作，同时取消暂停意图，
+	// 明确的「我要听这首」动作，同时取消暂停意图，
 	// 否则上一首的暂停会被带过来，看起来就像「选了但没反应」。
 	Music_WantPaused(false);
 
@@ -258,6 +661,8 @@ static void plPlayItem(lv_event_t *e)
 // 关闭列表页：重建主播放界面并销毁列表页
 static void plClose(lv_event_t *e)
 {
+	plScanAbort(); // 正在读目录的话先停掉，别让句柄漏了
+
 	// 顺序非常重要：必须先重建并切换主界面，最后才删除列表页。
 	// 原因：lv_disp_load_scr() 内部（lv_scr_load_anim）会对「当前活动屏幕」调用
 	// lv_obj_set_pos(lv_scr_act(), 0, 0)。若先把活动屏幕（列表页）删掉，
@@ -275,8 +680,16 @@ static void plClose(lv_event_t *e)
 	}
 	ui_plList = nullptr;
 	ui_plPageLabel = nullptr;
+	ui_plPathLabel = nullptr;
+
+	/* clear() 只析构元素、不还容量。这里用 swap 把 vector 换成一个空的，
+	   连容量一起还给堆 —— 否则「看一眼目录」会永久占住一块内存，
+	   正是「大数组常驻」的另一种写法。 */
+	std::vector<PlEntry>().swap(plEntries);
+	std::vector<String>().swap(plScanFolders);
+	plCurrentDir = "/";
 	plPage = 0;
-	plTotalPages = 0;
+	plTotalPages = 1;
 
 	// 通知主循环重新应用界面状态
 	UI_NotifyScreenRebuilt();
@@ -301,26 +714,22 @@ static lv_obj_t *plMakeButton(lv_obj_t *parent, const char *text, int x, int w, 
 	return btn;
 }
 
-/*播放列表按钮点击回调：新开播放列表页面，并销毁主播放界面*/
-void PlayListButtonClicked(lv_event_t *e)
+/* 打开独立页面（两种模式共用同一套界面骨架）*/
+static void plOpen(PlMode mode)
 {
 	if (ui_playListScreen != nullptr)
 	{
 		return; // 已经打开
 	}
 
-	plTotalPages = (fileCount + ITEMS_PER_PAGE - 1) / ITEMS_PER_PAGE;
-	if (plTotalPages < 1)
-	{
-		plTotalPages = 1;
-	}
-	plPage = (fileCount > 0) ? (music_i / ITEMS_PER_PAGE) : 0;
-	if (plPage >= plTotalPages)
-	{
-		plPage = plTotalPages - 1;
-	}
-
 	plLogMem("打开列表页: 进入");
+
+	plMode = mode;
+	plPage = 0;
+	plTotalPages = 1;
+	plEntries.clear();
+	plScanFolders.clear();
+	plScanAbort();
 
 	// 目标对象即将被销毁，先停掉正在运行的动画（如海报旋转）
 	lv_anim_del_all();
@@ -330,20 +739,28 @@ void PlayListButtonClicked(lv_event_t *e)
 	lv_obj_set_style_bg_color(ui_playListScreen, lv_color_hex(0x0B283D), LV_PART_MAIN | LV_STATE_DEFAULT);
 	lv_obj_set_style_bg_opa(ui_playListScreen, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
 
-	// 顶部工具栏：返回 / 上一页 / 下一页 / 页码
+	// 顶部工具栏：返回播放界面 / 上一页 / 下一页 / 页码
 	plMakeButton(ui_playListScreen, "返回", 3, 54, plClose);
 	plMakeButton(ui_playListScreen, "上一页", 62, 56, plPrevPage);
 	plMakeButton(ui_playListScreen, "下一页", 122, 56, plNextPage);
 
 	ui_plPageLabel = lv_label_create(ui_playListScreen);
-	lv_obj_set_pos(ui_plPageLabel, 184, 8);
+	lv_obj_set_pos(ui_plPageLabel, 182, 8);
 	lv_obj_set_style_text_font(ui_plPageLabel, &ui_font_AlibabaPuHuiTi_12, LV_PART_MAIN | LV_STATE_DEFAULT);
 	lv_obj_set_style_text_color(ui_plPageLabel, lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_DEFAULT);
 
-	// 曲目列表
+	// 标题行：平铺模式显示「全部歌曲」，浏览模式显示当前目录
+	ui_plPathLabel = lv_label_create(ui_playListScreen);
+	lv_obj_set_width(ui_plPathLabel, 232);
+	lv_obj_set_pos(ui_plPathLabel, 4, 27);
+	lv_label_set_long_mode(ui_plPathLabel, LV_LABEL_LONG_SCROLL_CIRCULAR);
+	lv_obj_set_style_text_font(ui_plPathLabel, &ui_font_AlibabaPuHuiTi_12, LV_PART_MAIN | LV_STATE_DEFAULT);
+	lv_obj_set_style_text_color(ui_plPathLabel, lv_color_hex(0x8FB8CE), LV_PART_MAIN | LV_STATE_DEFAULT);
+
+	// 条目列表
 	ui_plList = lv_list_create(ui_playListScreen);
-	lv_obj_set_size(ui_plList, 240, 292);
-	lv_obj_set_pos(ui_plList, 0, 28);
+	lv_obj_set_size(ui_plList, 240, 276);
+	lv_obj_set_pos(ui_plList, 0, 44);
 	lv_obj_set_style_radius(ui_plList, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
 	lv_obj_set_style_border_width(ui_plList, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
 	lv_obj_set_style_bg_color(ui_plList, lv_color_hex(0x000000), LV_PART_MAIN | LV_STATE_DEFAULT);
@@ -352,7 +769,26 @@ void PlayListButtonClicked(lv_event_t *e)
 
 	plLogMem("打开列表页: 框架就绪");
 
-	plLoadPage(plPage);
+	if (plMode == PL_MODE_FLAT)
+	{
+		// 平铺：一页一页取 musicFiles[]，不读卡、不建索引
+		plTotalPages = (fileCount + PL_ITEMS_PER_PAGE - 1) / PL_ITEMS_PER_PAGE;
+		if (plTotalPages < 1)
+		{
+			plTotalPages = 1;
+		}
+		plPage = (fileCount > 0) ? (music_i / PL_ITEMS_PER_PAGE) : 0;
+		if (plPage >= plTotalPages)
+		{
+			plPage = plTotalPages - 1;
+		}
+		plLoadPage(plPage);
+	}
+	else
+	{
+		// 浏览：每次都从根目录开始，行为可预期
+		plOpenDir("/");
+	}
 
 	plLogMem("打开列表页: 列表已填充");
 
@@ -367,4 +803,17 @@ void PlayListButtonClicked(lv_event_t *e)
 	}
 
 	plLogMem("打开列表页: 完成");
+}
+
+/* 右上角菜单图标：全部歌曲平铺（与改造前行为一致）
+   注意：这个函数名被 SquareLine 生成的 ui.c 调用，不要改名。 */
+void PlayListButtonClicked(lv_event_t *e)
+{
+	plOpen(PL_MODE_FLAT);
+}
+
+/* 左上角返回图标：文件浏览页（目录 + 歌曲） */
+void ui_event_Image1(lv_event_t *e)
+{
+	plOpen(PL_MODE_BROWSE);
 }

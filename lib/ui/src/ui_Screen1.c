@@ -231,6 +231,14 @@ void ui_Screen1_screen_init(void)
     lv_obj_add_flag(ui_Image1, LV_OBJ_FLAG_ADV_HITTEST);  /// Flags
     lv_obj_clear_flag(ui_Image1, LV_OBJ_FLAG_SCROLLABLE); /// Flags
 
+    /* 左上角这个返回图标，SquareLine 生成的是 lv_img（默认不可点）。
+       这里把它变成可点按钮并绑上事件：打开文件浏览页。
+       顺便把命中区域往四周扩 9px —— 图标本身只有 16x12，
+       手指直接点太费劲，扩大后大约 34x30，好按很多。 */
+    lv_obj_add_flag(ui_Image1, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_ext_click_area(ui_Image1, 9);
+    lv_obj_add_event_cb(ui_Image1, ui_event_Image1, LV_EVENT_CLICKED, NULL);
+
     ui_ImgButton2 = lv_imgbtn_create(ui_TopPanel);
     lv_imgbtn_set_src(ui_ImgButton2, LV_IMGBTN_STATE_RELEASED, NULL, &ui_img_caidan_png, NULL);
     lv_obj_set_width(ui_ImgButton2, 16);

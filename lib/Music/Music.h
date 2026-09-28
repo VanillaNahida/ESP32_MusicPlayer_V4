@@ -110,6 +110,31 @@ bool playlistExists();
 bool savePlaylist();
 bool loadPlaylist();
 void refreshPlaylist();
+
+/* ============ 供「文件浏览页」使用的路径/目录工具 ============
+   放在这里而不是 UI 里：它们都要读 SD 卡，而 SD 访问必须走 SPI 总线锁
+   （与 TFT 刷屏互斥）。关在一个地方，UI 侧就不用操心加锁的事。 */
+
+// 取父目录：".../a/b/c.mp3" -> ".../a/b"；根目录再往上仍然是 "/"
+String Music_ParentDir(const String &path);
+// 取文件名（含扩展名）
+String Music_BaseName(const String &path);
+
+/* ---------- 高效目录枚举（句柄式，支持增量/跨帧进行）----------
+
+   为什么不用 File::openNextFile()：
+   它内部会 new 一个 VFSFileImpl，而那个构造函数会对**每一个条目**做一次
+   按完整路径的 stat()。FATFS 的按路径查找是从目录开头逐条扫的，
+   于是遍历 n 个条目变成 O(n²) —— 实测一个 277 首的目录要做约 3.8 万次
+   目录项扫描，界面会在这一步冻住好几秒。
+   这里直接用 opendir/readdir：readdir 返回的 struct dirent 自带 d_type，
+   一次顺序扫描就同时拿到「名字」和「是不是目录」，复杂度回到 O(n)。
+
+   做成句柄式是为了让调用方能**分帧**枚举：每帧只看几十个条目，
+   再大的目录也不会把主循环卡住。 */
+void *Music_OpenDir(const char *dir);                                  // 失败返回 nullptr
+bool Music_ReadDir(void *handle, String &nameOut, bool &isDirOut);     // 没有更多条目返回 false
+void Music_CloseDir(void *handle);
 // 动态数组管理函数
 bool allocateMusicArray(int size);
 void freeMusicArray();

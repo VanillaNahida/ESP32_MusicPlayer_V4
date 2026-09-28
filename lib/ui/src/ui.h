@@ -61,6 +61,8 @@ extern lv_obj_t * ui_jiaopian;
 extern lv_obj_t * ui_haibao;
 extern lv_obj_t * ui_TopPanel;
 extern lv_obj_t * ui_Image1;
+// 左上角返回图标（fanhui）：点击后打开文件浏览页。实现在 ui_events.cpp
+void ui_event_Image1(lv_event_t * e);
 void ui_event_ImgButton2(lv_event_t * e);
 extern lv_obj_t * ui_ImgButton2;
 extern lv_obj_t * ui_Label2;
