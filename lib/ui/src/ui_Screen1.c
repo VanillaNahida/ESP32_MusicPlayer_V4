@@ -207,17 +207,9 @@ void ui_Screen1_screen_init(void)
     lv_obj_add_flag(ui_haibao, LV_OBJ_FLAG_ADV_HITTEST);  /// Flags
     lv_obj_clear_flag(ui_haibao, LV_OBJ_FLAG_SCROLLABLE); /// Flags
 
-    ui_citou = lv_img_create(ui_MidPanel);
-    lv_img_set_src(ui_citou, &ui_img_citou_png);
-    lv_obj_set_width(ui_citou, LV_SIZE_CONTENT);  /// 68
-    lv_obj_set_height(ui_citou, LV_SIZE_CONTENT); /// 141
-    lv_obj_set_x(ui_citou, 85);
-    lv_obj_set_y(ui_citou, -33);
-    lv_obj_set_align(ui_citou, LV_ALIGN_CENTER);
-    lv_obj_add_flag(ui_citou, LV_OBJ_FLAG_ADV_HITTEST);  /// Flags
-    lv_obj_clear_flag(ui_citou, LV_OBJ_FLAG_SCROLLABLE); /// Flags
-    lv_img_set_pivot(ui_citou, 50, 28);
-    lv_img_set_angle(ui_citou, -200);
+    /* 磁头（唱针）组件已整体移除：
+       只保留黑胶唱片底图（ui_jiaopian）与专辑封面（ui_haibao）。
+       连带删除的还有 ui_img_citou_png 图片资源，省下约 20KB Flash。 */
 
     ui_TopPanel = lv_obj_create(ui_Screen1);
     lv_obj_set_width(ui_TopPanel, 240);

@@ -5,9 +5,11 @@
 #include "AlbumArt.h"
 #include "AudioBusLock.h"
 #include "Touch.h"
+#include "PlaylistTool.h"
 
 /*函数声明*/
 void UI_update();
+void UI_CheckAudioTaskAlive();
 
 /* 串口调试命令（在 loop() 里处理）：
      t = 打印当前标定与一次实测换算（诊断触摸「错位」）
@@ -127,7 +129,7 @@ void setup()
   /* 音频/存储初始化（复用上面已初始化的 SPI 总线） */
   Music_Init();
 
-  // 音频初始化完成（命令队列已就绪）后再启动解码任务，内?
+  // 音频初始化完成（请求通道已就绪）后再启动解码任务，内?
   xTaskCreatePinnedToCore(audioTask, "audioTask", 16384, NULL, configMAX_PRIORITIES - 1, &audioTaskHandle, 0);
 
   delay(1000);
@@ -172,6 +174,29 @@ void setup()
   // 启动专辑封面后台解码任务（低优先级，解码完成后由 AlbumArt_Poll 换上?
   AlbumArt_Init();
 
+  // BOOT 键：按一下询问是否重建播放列表（带扫描进度显示）
+  PlaylistTool_Init();
+
+  /* ==================================================================
+     播放列表：先试缓存，没有再带进度界面扫描
+
+     为什么扫描放在这里、而不是 Music_Init() 里：
+     首次使用（卡里没有 music_playlist.bin）要全卡扫描，而扫描必须让用户
+     看到进度条。进度界面依赖 LVGL，可 Music_Init() 是在 lv_init()/ui_init()
+     **之前**调用的 —— 那时候还没有任何显示能力，只能干等一大片黑屏。
+     挪到这里之后，「首次使用扫描」和「按 BOOT 重建」共用同一套扫描代码
+     和同一个进度界面（PlaylistTool_RunFirstScan 内部就是那套）。
+     ================================================================== */
+  if (!Music_IsStorageReady())
+  {
+    Serial.println("[SETUP] SD 卡不可用，跳过播放列表加载与扫描");
+  }
+  else if (!Music_LoadPlaylistCache())
+  {
+    // 没有缓存 / 缓存无效 → 首次使用，带进度界面扫描整张卡
+    PlaylistTool_RunFirstScan();
+  }
+
   // 恢复上次播放状态（UI初始化后?
   Music_RestorePlayState();
 
@@ -182,25 +207,25 @@ void setup()
   lv_label_set_text(ui_MusicArtistLabel, currentArtist.c_str()); //  歌手?
   if (lrc_flag)
   {
-    lv_label_set_text(ui_MusicLrcLabel, "歌词加载?.."); //  加载歌词
+    lv_label_set_text(ui_MusicLrcLabel, "暂无歌词"); //  加载歌词
   }
   else
   {
     lv_label_set_text(ui_MusicLrcLabel, "暂无歌词"); //  加载歌词
   }
-  //  显示播放时间+进度?
-  if (duration != 0)
+  //  显示播放时间+进度条
+  //  【必须用 Music_GetDuration()】duration 由解码任务(core0)写、UI(core1)读，
+  //  直接读那个裸全局变量会因为缺 volatile 而读到永不更新的陈旧值，
+  //  表现为「进度条不动、时长一直是 00:00」。
+  long dur = Music_GetDuration();
+  if (dur != 0)
   {
+    uint32_t cur = Music_GetCurrentPlayTime();
 
-    lv_img_set_angle(ui_citou, map(Music_GetCurrentPlayTime(), 0, duration, 60, -60)); // 设置磁头转动角度
+    lv_label_set_text_fmt(ui_MusicTimeLabel1, "%02d:%02d", (int)(cur / 60), (int)(cur % 60));
+    lv_label_set_text_fmt(ui_MusicTimeLabel2, "%02d:%02d", (int)(dur / 60), (int)(dur % 60));
 
-    uint8_t minutes = Music_GetCurrentPlayTime() / 60;
-    uint8_t seconds = Music_GetCurrentPlayTime() % 60;
-
-    lv_label_set_text_fmt(ui_MusicTimeLabel1, "%02d:%02d", minutes, seconds);
-    lv_label_set_text_fmt(ui_MusicTimeLabel2, "%02d:%02d", duration / 60, duration % 60);
-
-    lv_bar_set_value(ui_Bar1, map(Music_GetCurrentPlayTime(), 0, duration, 0, 100), LV_ANIM_OFF);
+    lv_bar_set_value(ui_Bar1, map(cur, 0, dur, 0, 100), LV_ANIM_OFF);
   }
 }
 
@@ -223,7 +248,17 @@ void loop()
   }
 
   lv_timer_handler(); /* let the GUI do its work */
-  UI_update();        // 更新UI
+  PlaylistTool_Poll(); // BOOT 键 + 重建进度（内部按小片推进扫描，不阻塞）
+
+  /* 重建期间跳过主界面刷新：
+     此刻 musicFiles 数组正在被重新分配、fileCount 会在 0 和实际值之间跳，
+     UI_update() 里的「换歌检测」和歌词解析都不该在这时候跑。
+     进度弹窗自己挂在 top layer 上，不受影响。 */
+  if (!PlaylistTool_IsBusy())
+  {
+    UI_update(); // 更新UI
+  }
+  UI_CheckAudioTaskAlive(); // 解码任务卡死检测（见下）
   delay(5);
 }
 // ===== 界面刷新状?=====
@@ -236,11 +271,53 @@ static bool ui_coverShownDefault = false; // 当前显示的是否为默认封�
 static bool ui_needsRefresh = false;      // 主界面被重建后置位，需要整体重?
 static uint32_t ui_lastShownSec = 0xFFFFFFFF; // 上次已显示到界面上的秒数
 static bool ui_lrcPlaceholderShown = false;   // 是否已显示过“暂无歌词”占位文?
+static bool ui_lrcEmbeddedChecked = false;    // 本曲是否已补查过内嵌歌词
 
 // 主界面被销毁后重新创建时调用（?lib/ui/ui.h 声明?
 void UI_NotifyScreenRebuilt(void)
 {
     ui_needsRefresh = true;
+}
+
+/* ==================================================================
+   解码任务「卡死」检测
+
+   为什么需要它：
+   界面上所有音频操作（播放/暂停、上一首/下一首、音量、列表选曲）
+   最终都只是给解码任务发表请求，真正把请求变成声音的是 core0 上的
+   audioTask → Music_Loop()。它是这些请求**唯一**的消费点。
+   一旦这个任务卡在某处不返回，用户看到的现象就是「点了完全没反应」，
+   而 UI 侧（触摸、按钮、标签）看起来一切正常，非常容易误判成
+   「事件没绑定」或「触摸坏了」—— 之前就是这样白查了很久。
+
+   Music_GetLoopSeq() 每跑一轮 Music_Loop() 就自增一次，
+   正常情况下 5ms 内必然变化。这里只要发现它长时间不动，
+   就直接把结论打到串口，省掉下一次的重复排查。
+   ================================================================== */
+void UI_CheckAudioTaskAlive()
+{
+    static uint32_t lastSeq = 0;
+    static uint32_t lastChangeMs = 0;
+    static bool warned = false;
+
+    uint32_t seq = Music_GetLoopSeq();
+    uint32_t now = millis();
+
+    if (seq != lastSeq)
+    {
+        lastSeq = seq;
+        lastChangeMs = now;
+        warned = false;
+        return;
+    }
+
+    if (!warned && (now - lastChangeMs) > 3000)
+    {
+        warned = true;
+        Serial.println("[UI] 警告：解码任务已 3 秒无响应（Music_Loop 没有推进）。");
+        Serial.println("[UI]       此时界面上所有播放相关操作都不会生效，问题在解码任务侧，");
+        Serial.println("[UI]       请查看上面是否有 [AUDIO] 警告：单次解码阻塞 ... 的打印。");
+    }
 }
 
 // 专辑封面：立即显示默认封面，内嵌封面由后台任务解码完成后再换上?
@@ -300,19 +377,24 @@ static void UI_ApplyCurrentState(void)
     shownTitle = currentTitle;
     shownArtist = currentArtist;
 
-    lv_label_set_text(ui_MusicLrcLabel, lrc_flag ? "歌词加载?.." : "暂无歌词");
+    lv_label_set_text(ui_MusicLrcLabel, lrc_flag ? "歌词加载中..." : "暂无歌词");
 
-    if (duration > 0)
+    // 【必须用 Music_GetDuration()】跨核读取，见 UI_ApplyCurrentState() 中的说明
+    long dur = Music_GetDuration();
+    if (dur > 0)
     {
         long cur = (long)Music_GetCurrentPlayTime();
         lv_label_set_text_fmt(ui_MusicTimeLabel1, "%02d:%02d", (int)(cur / 60), (int)(cur % 60));
-        lv_label_set_text_fmt(ui_MusicTimeLabel2, "%02d:%02d", (int)(duration / 60), (int)(duration % 60));
-        lv_bar_set_value(ui_Bar1, map(cur, 0, duration, 0, 100), LV_ANIM_OFF);
-        lv_img_set_angle(ui_citou, map(cur, 0, duration, 60, -60));
+        lv_label_set_text_fmt(ui_MusicTimeLabel2, "%02d:%02d", (int)(dur / 60), (int)(dur % 60));
+        lv_bar_set_value(ui_Bar1, map(cur, 0, dur, 0, 100), LV_ANIM_OFF);
     }
     else
     {
-        lv_img_set_angle(ui_citou, -200);
+        /* 时长还没解析出来（刚切歌 / 正在装载）。
+           这里必须把时间和进度清零：留着上一首的数字会让人以为界面没更新。 */
+        lv_label_set_text(ui_MusicTimeLabel1, "00:00");
+        lv_label_set_text(ui_MusicTimeLabel2, "00:00");
+        lv_bar_set_value(ui_Bar1, 0, LV_ANIM_OFF);
     }
 
     if (Music_IsPlaying())
@@ -325,10 +407,72 @@ static void UI_ApplyCurrentState(void)
     {
         _ui_flag_modify(ui_PauseButton, LV_OBJ_FLAG_HIDDEN, _UI_MODIFY_FLAG_ADD);
         _ui_flag_modify(ui_PlayButton, LV_OBJ_FLAG_HIDDEN, _UI_MODIFY_FLAG_REMOVE);
-        lv_label_set_text(ui_Label2, "暂停播放");
+        /* 没在播放时要区分两种情况，别一律写成「暂停播放」：
+             · pause_status==1 → 用户自己按的暂停
+             · 否则           → 正在装载（或刚播完），对用户来说就是「正在加载」
+           写错会让用户以为程序卡住了 —— 明明刚点了歌，却显示暂停。 */
+        lv_label_set_text(ui_Label2, pause_status ? "暂停播放" : "正在加载?..");
     }
 
     UI_UpdateAlbumArt();
+}
+
+/* ==================================================================
+   换曲目：**立刻**把界面上的所有文字切成新曲目的内容
+
+   为什么要单独抽出来、而且放在播放状态判断之外：
+   原来这段逻辑写在 `if (Music_IsPlaying())` 里面，而「用户刚选了歌」
+   的那一刻恰恰是**没在播放**的（解码器正在装载）。于是标题、歌手、时间、
+   进度、歌词全都要等装载完、真正开始播之后才更新 ——
+   用户看到的就是「列表里选了曲，界面上有部分文字还是旧的」。
+
+   现在改成：只要检测到曲目索引变化就立刻刷新，不管后台在干什么。
+   这也是「UI 不能被后台阻塞」的一部分 —— 用户点了，界面就必须有反应。
+   ================================================================== */
+static void UI_HandleTrackChange(void)
+{
+    if (music_prev_i == music_i)
+    {
+        return;
+    }
+    music_prev_i = music_i;
+
+    if (fileCount <= 0 || music_i < 0 || music_i >= fileCount)
+    {
+        return;
+    }
+
+    durationPrinted = false;
+    ui_lastShownSec = 0xFFFFFFFF;
+    ui_lrcPlaceholderShown = false;
+    ui_lrcEmbeddedChecked = false; // 新曲目：还没等过它的内嵌歌词
+
+    /* 1) 标题/歌手立刻换成新曲目。
+        Music_ResetTrackInfo() 清掉上一首的元数据，Music_info() 随即用
+        文件名兜底 —— 即使新曲目没有标签，界面也不会继续挂着上一首的歌名。 */
+    Music_ResetTrackInfo();
+    Music_info();
+    shownTitle = currentTitle;
+    shownArtist = currentArtist;
+    lv_label_set_text(ui_MusicTitleLabel, currentTitle.c_str());
+    lv_label_set_text(ui_MusicArtistLabel, currentArtist.c_str());
+    lv_label_set_long_mode(ui_MusicTitleLabel, LV_LABEL_LONG_SCROLL_CIRCULAR);
+
+    /* 2) 时间与进度清零。
+        不清的话会一直显示上一首的 01:25 和进度，直到新时长解析出来为止。 */
+    lv_label_set_text(ui_MusicTimeLabel1, "00:00");
+    lv_label_set_text(ui_MusicTimeLabel2, "00:00");
+    lv_bar_set_value(ui_Bar1, 0, LV_ANIM_OFF);
+
+    /* 3) 歌词：此刻能查到的只有「同名 .lrc」和 /lrc/ 下已生成的文件；
+        曲目内嵌歌词要等解码任务解析完，由 UI_update() 里的补查兜底。 */
+    parseLrcFile(musicFiles[music_i]);
+    lv_label_set_text(ui_MusicLrcLabel, lrc_flag ? "歌词加载中..." : "暂无歌词");
+    ui_lrcPlaceholderShown = !lrc_flag;
+
+    /* 4) 顶栏立刻给出反馈，让用户知道「点到了」 */
+    lv_label_set_text(ui_Label2, "正在加载?..");
+    Serial.printf("[UI] 切到第 %d 首: %s\n", music_i + 1, musicFiles[music_i].c_str());
 }
 
 void UI_update()
@@ -338,6 +482,9 @@ void UI_update()
     {
         return;
     }
+
+    // 换曲目优先处理：它会把标题/歌手/时间/进度/歌词一次性设成新曲目的值
+    UI_HandleTrackChange();
 
     // 主界面被重建（从播放列表页返回）?整体重新应用一次状?
     if (ui_needsRefresh)
@@ -351,6 +498,7 @@ void UI_update()
         ui_coverShownDefault = false;
         ui_lastShownSec = 0xFFFFFFFF;
         ui_lrcPlaceholderShown = false;
+        ui_lrcEmbeddedChecked = false;
         UI_ApplyCurrentState();
     }
 
@@ -378,7 +526,6 @@ void UI_update()
         {
             _ui_flag_modify(ui_PlayButton, LV_OBJ_FLAG_HIDDEN, _UI_MODIFY_FLAG_ADD);     // 隐藏播放按钮
             _ui_flag_modify(ui_PauseButton, LV_OBJ_FLAG_HIDDEN, _UI_MODIFY_FLAG_REMOVE); // 显示暂停按钮
-            lv_img_set_angle(ui_citou, 0);                                               // 磁头转到播放位置
             // 注意：海报（专辑封面）不再做旋转动画。旋转一张带 Alpha 的图片需要每帧软?
             // 变换 + 混合，会持续占满 SPI 刷屏带宽，与 SD 读卡争用同一?SPI 总线?
             // 表现为上半屏花屏/卡死 + 音频卡顿。封面改为静态显示?
@@ -390,32 +537,42 @@ void UI_update()
             lv_label_set_long_mode(ui_MusicTitleLabel, LV_LABEL_LONG_SCROLL_CIRCULAR);   // 重新设置标题标签滚动模式
             lv_label_set_long_mode(ui_MusicLrcLabel, LV_LABEL_LONG_SCROLL_CIRCULAR);     // 重新设置歌词标签滚动模式
 
+            // 装载完成、真正开始出声了：把顶栏从「正在加载…」切回「正在播放」
+            lv_label_set_text(ui_Label2, "正在播放");
             play_executed = true; // 设置执行标志
             pause_executed = false;
             Serial.println("播放执行标志位");
         }
 
-    if (music_prev_i != music_i) // 播放歌曲索引与上一个歌曲索引不一?,重新解析歌曲信息和歌?
-    {
-      // 重置时长；曲目信息（标题/歌手/时长）由解码器通过回调异步提供
-      duration = 0;
-      durationPrinted = false;
-      parseLrcFile(musicFiles[music_i]); //  歌词解析
+    /* 换曲目的处理已经提前到 UI_update() 开头的 UI_HandleTrackChange() 里了
+       （见那里的说明：必须在「还没开始播」的时候就刷新界面，
+        否则用户从列表里选歌后会看到一堆上一首的旧文字）。 */
 
-      // 更新索引追踪
-      music_prev_i = music_i;
-      ui_lastShownSec = 0xFFFFFFFF; // 强制下一帧刷新时?进度
-      ui_lrcPlaceholderShown = false;
+    /* 【内嵌歌词补查 + /lrc 懒生成】
+       上面那次 parseLrcFile() 发生在「刚刚切歌」的瞬间，此时解码任务
+       还没读文件、标签根本没解析，所以内嵌歌词一定是拿不到的。
+       等解码任务把这首的内嵌歌词解析出来（Music_EmbeddedLyricsReady），
+       再补查一次 —— 这一步同时也是**唯一**会生成 /lrc/<歌名>.lrc 的地方
+       （parseLrcFile 命中内嵌歌词后会顺手落盘），完全符合
+       「歌词只在要播放歌曲的时候才读取生成」的设计。
+       注意判据里带了曲目归属，不会把上一首残留的歌词误当成这一首的。 */
+    if (!lrc_flag && !ui_lrcEmbeddedChecked && fileCount > 0 &&
+        music_i >= 0 && music_i < fileCount &&
+        Music_EmbeddedLyricsReady(musicFiles[music_i].c_str()))
+    {
+      ui_lrcEmbeddedChecked = true;
+      parseLrcFile(musicFiles[music_i]);
       if (lrc_flag)
       {
-        lv_label_set_text(ui_MusicLrcLabel, "歌词加载?.."); //  加载歌词
+        ui_lrcPlaceholderShown = false;
+        lv_label_set_text(ui_MusicLrcLabel, "歌词加载中...");
+        Serial.println("已补查到曲目内嵌歌词（并生成 /lrc 文件）");
       }
       else
       {
-        lv_label_set_text(ui_MusicLrcLabel, "暂无歌词"); //  加载歌词
+        lv_label_set_text(ui_MusicLrcLabel, "暂无歌词");
         ui_lrcPlaceholderShown = true;
       }
-      Serial.println("更新索引和歌词");
     }
 
     // 显示播放歌词
@@ -442,31 +599,31 @@ void UI_update()
       lv_label_set_text(ui_MusicLrcLabel, "暂无歌词"); //  加载歌词
     }
     //  显示播放时间+进度条（按「秒」节流）
-    //  说明：lv_label_set_text_fmt 每次都会重新分配字符串并 invalidate?
-    //  ?5ms 的主循环频率调用会产生大量刷新与内存抖动，必须按秒更新?
-    if (duration != 0)
+    //  说明：lv_label_set_text_fmt 每次都会重新分配字符串并 invalidate，
+    //  以 5ms 的主循环频率调用会产生大量刷新与内存抖动，必须按秒更新。
+    //  【必须用 Music_GetDuration()】跨核读取，见 UI_ApplyCurrentState() 中的说明。
+    long dur = Music_GetDuration();
+    if (dur != 0)
     {
       uint32_t cur = Music_GetCurrentPlayTime();
       if (cur != ui_lastShownSec)
       {
         ui_lastShownSec = cur;
-        lv_img_set_angle(ui_citou, map(cur, 0, duration, 60, -60)); // 设置磁头转动角度
         lv_label_set_text_fmt(ui_MusicTimeLabel1, "%02d:%02d", (int)(cur / 60), (int)(cur % 60));
-        lv_label_set_text_fmt(ui_MusicTimeLabel2, "%02d:%02d", (int)(duration / 60), (int)(duration % 60));
-        lv_bar_set_value(ui_Bar1, map(cur, 0, duration, 0, 100), LV_ANIM_OFF);
+        lv_label_set_text_fmt(ui_MusicTimeLabel2, "%02d:%02d", (int)(dur / 60), (int)(dur % 60));
+        lv_bar_set_value(ui_Bar1, map(cur, 0, dur, 0, 100), LV_ANIM_OFF);
       }
     }
   }
   else
   {
-    /* 没在播放时，先只负责把按钮/磁头切到「暂停」外观。
+    /* 没在播放时，先只负责把按钮切到「暂停」外观。
        注意这里**不能**顺手判断「该切下一首了」：
        !Music_IsPlaying() 在「正在装载」和「用户暂停」时同样成立。 */
     if (!pause_executed)
     {
       _ui_flag_modify(ui_PauseButton, LV_OBJ_FLAG_HIDDEN, _UI_MODIFY_FLAG_ADD);   // 隐藏暂停按钮
       _ui_flag_modify(ui_PlayButton, LV_OBJ_FLAG_HIDDEN, _UI_MODIFY_FLAG_REMOVE); // 显示播放按钮
-      lv_img_set_angle(ui_citou, -200); // 磁头转到停止位置
       pause_executed = true;
     }
 

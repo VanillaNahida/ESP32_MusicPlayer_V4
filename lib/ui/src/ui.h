@@ -59,7 +59,6 @@ void ui_event_MidPanel(lv_event_t * e);
 extern lv_obj_t * ui_MidPanel;
 extern lv_obj_t * ui_jiaopian;
 extern lv_obj_t * ui_haibao;
-extern lv_obj_t * ui_citou;
 extern lv_obj_t * ui_TopPanel;
 extern lv_obj_t * ui_Image1;
 void ui_event_ImgButton2(lv_event_t * e);
@@ -93,7 +92,6 @@ LV_IMG_DECLARE(ui_img_shangyi1_png);    // assets/shangyi1.png
 LV_IMG_DECLARE(ui_img_shangyi2_png);    // assets/shangyi2.png
 LV_IMG_DECLARE(ui_img_jiaopian_png);    // assets/jiaopian.png
 LV_IMG_DECLARE(ui_img_haibao_png);    // assets/haibao.png
-LV_IMG_DECLARE(ui_img_citou_png);    // assets/citou.png
 LV_IMG_DECLARE(ui_img_fanhui_png);    // assets/fanhui.png
 LV_IMG_DECLARE(ui_img_caidan_png);    // assets/caidan.png
 LV_IMG_DECLARE(ui_img_random_play_png); // assets/RANDOM_PLAY.png

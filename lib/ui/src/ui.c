@@ -41,7 +41,6 @@ void ui_event_MidPanel(lv_event_t *e);
 lv_obj_t *ui_MidPanel;
 lv_obj_t *ui_jiaopian;
 lv_obj_t *ui_haibao;
-lv_obj_t *ui_citou;
 lv_obj_t *ui_TopPanel;
 lv_obj_t *ui_Image1;
 void ui_event_ImgButton2(lv_event_t *e);

@@ -37,18 +37,15 @@ static int plTotalPages = 0;   // 总页数
 
 void PauseClicke(lv_event_t *e)
 {
-	lv_img_set_angle(ui_citou, -200); // 磁头旋转到停止位
-	pause_status = 1;				  // 手动暂停标志位
-	Music_Pause();					  // 暂停播放音乐
+	// 磁头（唱针）组件已移除，暂停/播放不再需要转动唱针
+	pause_status = 1; // 手动暂停标志位
+	Music_Pause();	  // 暂停播放音乐
 	lv_label_set_text(ui_Label2, "暂停播放");
 }
 
 void PlayClicked(lv_event_t *e)
 {
-	if (duration > 0) // 时长未知时不计算磁头角度，避免 map() 的 min==max 告警
-	{
-		lv_img_set_angle(ui_citou, map(Music_GetCurrentPlayTime(), 0, duration, 60, -60)); // 设置磁头转动角度
-	}
+	// 磁头（唱针）组件已移除，播放时不再计算唱针角度
 	// 封面为静态显示，不再启动旋转动画（详见 main.cpp 中的说明）
 	pause_status = 0; // 手动暂停标志位取消
 	Music_Play();
@@ -251,6 +248,9 @@ static void plPlayItem(lv_event_t *e)
 	Music_PlayPath(musicFiles[index].c_str());
 	savePlayState();
 	pause_status = 0; // 手动暂停标志位取消
+	// 列表选曲是明确的「我要听这首」动作，同时取消暂停意图，
+	// 否则上一首的暂停会被带过来，看起来就像「选了但没反应」。
+	Music_WantPaused(false);
 
 	plClose(NULL);
 }

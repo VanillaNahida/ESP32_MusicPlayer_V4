@@ -23,8 +23,8 @@ unsigned lodepng_decode32(unsigned char **out, unsigned *w, unsigned *h,
                           const unsigned char *in, size_t insize);
 }
 
-// 海报位尺寸（与 ui_Screen1 里的 ui_haibao 一致）
-#define ALBUM_ART_BOX 93
+// 海报位尺寸（与 ui_Screen1 里的 ui_haibao 一致）// 原93px
+#define ALBUM_ART_BOX 155
 // 每像素 3 字节（RGB565 低字节、高字节、Alpha）
 #define ALBUM_ART_BUF_BYTES (ALBUM_ART_BOX * ALBUM_ART_BOX * 3)
 // tjpgd 工作区大小
@@ -54,6 +54,7 @@ struct JpgCtx
     int srcH;
     int outW;
     int outH;
+    uint32_t lastYieldMs; // 上次主动让出 CPU 的时刻（见 artYieldIfDue）
 };
 
 static JpgCtx s_ctx;
@@ -88,10 +89,45 @@ static UINT jpgReadCb(JDEC *jd, BYTE *buff, UINT nbyte)
     return n;
 }
 
+/* ==================================================================
+   【这张回调里必须定期让出 CPU —— 否则整机会被看门狗复位】
+
+   本函数在 albumArtTask 里被调用，那个任务被固定在 **core0、优先级 1**。
+   而 FreeRTOS 的 IDLE 任务优先级是 **0** —— 也就是说：
+   只要 albumArtTask 在连着算不让出 CPU，IDLE0 就连一次都拿不到 CPU。
+
+   而 ESP-IDF 的 Task Watchdog 正是靠 IDLE0 定期「喂狗」来判断系统还活着的，
+   喂不上就 Aborting + 整机复位。实测现象：
+
+       E task_wdt: Task watchdog got triggered.
+       E task_wdt:  - IDLE0 (CPU 0)
+       E task_wdt: CPU 0: audioTask          ← 只有当前任务的快照，别被它带偏
+
+   触发条件是「封面足够大」：1500x1500 的图 tjpgd 要哈夫曼解码 225 万像素，
+   在 240MHz 上要好几秒，远超看门狗超时。所以只要播放大封面的歌就必然重启。
+
+   注意：光在 Music_Loop() 里加 delay 是没用的 —— 音频任务让出 CPU 之后，
+   排在 IDLE0 前面的 albumArtTask（优先级 1 > 0）会立刻顶上，IDLE0 照样饿死。
+   必须让**这个任务自己**定期阻塞，IDLE0 才有机会跑。
+
+   做法：每 5ms 主动 vTaskDelay(1)。对解码总耗时的影响可以忽略
+   （一次 1500x1500 的解码大约 150 次回调，合计多花 150ms）。
+   ================================================================== */
+static inline void artYieldIfDue(JpgCtx *ctx)
+{
+    if ((uint32_t)(millis() - ctx->lastYieldMs) >= 5)
+    {
+        ctx->lastYieldMs = millis();
+        vTaskDelay(1);
+    }
+}
+
 static UINT jpgWriteCb(JDEC *jd, void *bitmap, JRECT *rect)
 {
     JpgCtx *ctx = (JpgCtx *)jd->device;
     const uint8_t *src = (const uint8_t *)bitmap;
+
+    artYieldIfDue(ctx); // 见上面那段说明：不让出 CPU 会被看门狗复位
 
     for (int y = (int)rect->top; y <= (int)rect->bottom; y++)
     {
@@ -149,6 +185,19 @@ static bool decodeJpeg(const uint8_t *data, size_t len, uint8_t *out)
         return false;
     }
 
+    /* 【失控保护】超大封面直接放弃。
+       解码耗时与源图像素数成正比 —— tjpgd 即使降采样，也要把整幅图的
+       哈夫曼数据解一遍。1500x1500 就要好几秒，几万像素的图会让
+       albumArtTask 长时间霸占 core0（界面刷新、SD 读卡都会跟着变慢）。
+       （让出 CPU 的逻辑已经能保证不触发看门狗，这个上限纯粹是为了体验。）
+       显示框只有 155x155，4096x4096 已经是 700 倍余量，正常封面够用。 */
+    if ((uint64_t)s_jdec.width * (uint64_t)s_jdec.height > (4096ULL * 4096ULL))
+    {
+        Serial.printf("封面：源图过大 (%ux%u)，跳过解码\n",
+                      (unsigned)s_jdec.width, (unsigned)s_jdec.height);
+        return false;
+    }
+
     // 取最大的降采样级别，让解码尺寸仍不小于显示框（后续只做缩小）
     int scale = 0;
     for (int k = 3; k >= 0; k--)
@@ -202,6 +251,13 @@ static bool decodePng(const uint8_t *data, size_t len, uint8_t *out)
 
     for (int dy = 0; dy < ALBUM_ART_BOX; dy++)
     {
+        /* 同样要定期让出 CPU：lodepng_decode32 本身是长计算，
+           这里的缩放循环也要几百毫秒（见 artYieldIfDue 的说明）。 */
+        if ((dy & 15) == 0)
+        {
+            vTaskDelay(1);
+        }
+
         uint32_t sy = (uint32_t)dy * h / ALBUM_ART_BOX;
         uint8_t *row = out + (size_t)dy * ALBUM_ART_BOX * 3;
         for (int dx = 0; dx < ALBUM_ART_BOX; dx++)
@@ -254,6 +310,7 @@ static void albumArtTask(void *param)
 
         uint8_t *buf = artAlloc(ALBUM_ART_BUF_BYTES);
         bool ok = false;
+        uint32_t decodeStart = millis();
         if (buf != nullptr)
         {
             if (data[0] == 0xFF && data[1] == 0xD8)
@@ -273,6 +330,15 @@ static void albumArtTask(void *param)
         {
             Serial.println("封面：解码缓冲分配失败");
         }
+        /* 报一下解码耗时和源图尺寸。
+           大封面的解码是纯 CPU 长任务：1500x1500 的 JPEG 要好几秒。
+           这段期间 albumArtTask（core0，优先级 1）一直占着 CPU，
+           所以它必须定期 vTaskDelay 让 IDLE0 喂狗（见 artYieldIfDue 的说明）。
+           这条日志能直接告诉你「封面是不是太大了」。 */
+        uint32_t decodeCost = millis() - decodeStart;
+        Serial.printf("封面：解码%s，耗时 %u ms，源图 %ux%u\n",
+                      ok ? "成功" : "失败", (unsigned)decodeCost,
+                      (unsigned)s_jdec.width, (unsigned)s_jdec.height);
         AudioFileSourceID3::pictureUnlock();
 
         s_reqPending = false;

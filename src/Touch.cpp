@@ -37,12 +37,12 @@
    所以在编译期直接拦住。
 
    ⚠ 改 lib/Music/Music.cpp 或 User_Setup.h 的引脚时，**必须同步改这里**，
-   否则这道检查会因为比对的是旧值而形同虚设（曾经就漏过一次：
-   I2S 已从 18 改到 5，这里却还写着 18）。
+   否则这道检查会因为比对的是旧值而形同虚设（已经漏过两次了：
+   一次是 I2S 从 18 改到 5 却还写着 18，一次是后来改成 1/2/8 却还写着 5/6/7）。
    ================================================================== */
-#define TOUCH_I2S_BCLK_PIN 5  /* 与 lib/Music/Music.cpp 的 I2S_BCLK 保持一致 */
-#define TOUCH_I2S_LRC_PIN 6   /* 与 lib/Music/Music.cpp 的 I2S_LRC  保持一致 */
-#define TOUCH_I2S_DOUT_PIN 7  /* 与 lib/Music/Music.cpp 的 I2S_DOUT 保持一致 */
+#define TOUCH_I2S_BCLK_PIN 1  /* 与 lib/Music/Music.cpp 的 I2S_BCLK 保持一致 */
+#define TOUCH_I2S_LRC_PIN 2   /* 与 lib/Music/Music.cpp 的 I2S_LRC  保持一致 */
+#define TOUCH_I2S_DOUT_PIN 8  /* 与 lib/Music/Music.cpp 的 I2S_DOUT 保持一致 */
 #define TOUCH_SD_CS_PIN 38    /* 与 lib/Music/Music.cpp 的 SD_Pin   保持一致 */
 #define TOUCH_BOOT_PIN 0      /* GPIO0 是 strapping 引脚，务必避开 */
 
@@ -326,9 +326,34 @@ void Touch_Read(lv_indev_drv_t *drv, lv_indev_data_t *data)
         return;
     }
 
-    data->point.x = (lv_coord_t)scaleToScreen(rawX, s_xLeft, s_xRight, s_width);
-    data->point.y = (lv_coord_t)scaleToScreen(rawY, s_yTop, s_yBottom, s_height);
+    lv_coord_t sx = (lv_coord_t)scaleToScreen(rawX, s_xLeft, s_xRight, s_width);
+    lv_coord_t sy = (lv_coord_t)scaleToScreen(rawY, s_yTop, s_yBottom, s_height);
+
+    data->point.x = sx;
+    data->point.y = sy;
     data->state = LV_INDEV_STATE_PR;
+
+    /* 排查「UI 完全没反应」用：把真实上报给 LVGL 的坐标打出来。
+       判读方法（关键是把「有没有上报」和「上报得对不对」分开看）：
+         · 按住屏幕完全没有任何 [TOUCH] 上报行
+               → 触摸根本没读到（SPI/CS/供电），与坐标无关
+         · 有上报且 state=PR，但坐标明显不对（比如恒为某点）
+               → 轴方向/标定问题，改 TOUCH_ROTATION 或标定值
+         · 有上报、坐标也对，但界面仍无响应
+               → 问题在 LVGL/事件绑定层，不在触摸
+       为避免刷屏，只在「按下/抬起/坐标明显变化」时打印。 */
+    static bool s_dbgPrevPr = false;
+    static lv_coord_t s_dbgPrevX = -1, s_dbgPrevY = -1;
+    bool pr = true;
+    bool moved = (abs((int)sx - (int)s_dbgPrevX) > 6) || (abs((int)sy - (int)s_dbgPrevY) > 6);
+    if (pr != s_dbgPrevPr || moved)
+    {
+        s_dbgPrevPr = pr;
+        s_dbgPrevX = sx;
+        s_dbgPrevY = sy;
+        Serial.printf("[TOUCH] raw=(%d,%d) z=%d -> 屏幕 (%d,%d) state=PR\n",
+                      (int)rawX, (int)rawY, (int)rawZ, (int)sx, (int)sy);
+    }
 }
 
 /* 自检用：把当前标定和一次实测的换算结果打出来。
