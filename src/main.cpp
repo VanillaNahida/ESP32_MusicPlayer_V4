@@ -5,18 +5,29 @@
 #include "AlbumArt.h"
 #include "AudioBusLock.h"
 #include "Touch.h"
+#include "TouchCal.h"
 #include "PlaylistTool.h"
+#include "PerfOverlay.h"
+#include "SdHotplug.h"
+#include "FontManager.h"
+#include "AudioProfile.h"
 #include "esp_heap_caps.h"
 
 /*函数声明*/
 void UI_update();
 void UI_CheckAudioTaskAlive();
 
-/* 串口调试命令（在 loop() 里处理）：
+/* 串口调试/校准命令（在 loop() 里处理）：
      t = 打印当前标定与一次实测换算（诊断触摸「错位」）
+     c = 开始触摸校准：屏幕依次显示 4 个十字标记，逐个触摸其中心，
+         采到的原始值会外推成四边标定值，立即生效并保存到 NVS
+     x = 取消正在进行的校准
 
-   触摸校准界面已移除：标定值直接沿用 Touch.cpp 顶部那组项目实测值。
-   原因见 Touch.cpp 中「校准界面相关接口已全部移除」的说明。 */
+   为什么校准入口放在串口而不是屏幕上的按钮：标定不准时按屏幕按钮会
+   点不中它（「用错的标定去校准标定」的死锁）。详见 src/TouchCal.h。
+
+   音量记忆：调音量时由 setVolume() 实时写入 NVS，开机由
+   Music_LoadVolume() 恢复，与 SD 卡无关（见 lib/Music/Music.cpp）。 */
 
 /*Don't forget to set Sketchbook location in File/Preferences to the path of your UI project (the parent foder of this INO file)*/
 
@@ -186,7 +197,19 @@ void setup()
   indev_drv.read_cb = my_touchpad_read;
   lv_indev_drv_register(&indev_drv);
 
+  /* SD 卡字体（可选，见 include/FontManager.h）：
+     注册 LVGL 的文件系统驱动，并尝试把 <sd>/fonts/*.bin 读进 PSRAM。
+     成功就用它（全量 CJK 覆盖），失败/没插卡就回退内置字体，不影响启动。
+     ⚠ 必须在 ui_init() **之前**：界面里所有 set_text_font 都取这里的指针，
+       晚于 ui_init 的话界面已经用内置字体创建好了。 */
+  FontManager_Init();
+
   ui_init();
+
+  /* 性能浮窗：必须在 ui_init() 之后 —— 它要往 lv_layer_top() 上挂控件，
+     而 top layer 是 lv_init() 时就建好、ui_init() 之后才用得上。
+     编译期开关见 PerfOverlay.h（-DENABLE_PERF_OVERLAY=1）。 */
+  PerfOverlay_Init();
 
   // 上电直接进主界面，不再强制进入校准界面。
   // 触屏标定值写死在 Touch.cpp 顶部（沿用项目原本实测可用的那组），
@@ -197,6 +220,11 @@ void setup()
 
   // BOOT 键：按一下询问是否重建播放列表（带扫描进度显示）
   PlaylistTool_Init();
+
+  /* SD 卡热插拔检测 + 浮窗提醒。
+     必须在 UI（lv_layer_top）就绪之后初始化：它可能要立刻弹「SD卡未插入」的浮窗，
+     也要能随运行中拔卡/插卡给出「已拔出/已插入」提醒。 */
+  SdHotplug_Init();
 
   /* ==================================================================
      播放列表：先试缓存，没有再带进度界面扫描
@@ -239,7 +267,11 @@ void setup()
   //  直接读那个裸全局变量会因为缺 volatile 而读到永不更新的陈旧值，
   //  表现为「进度条不动、时长一直是 00:00」。
   long dur = Music_GetDuration();
-  if (dur != 0)
+  /* 拖动进度条期间**不要**刷新进度和时间：
+     否则解码进度会每 5ms 把用户拖到的位置覆盖掉，
+     表现为"手指滑到 2:30，进度条却顽固地弹回 1:05"。
+     拖动时的显示由 ui_event_ProgressBar 自己负责。 */
+  if (dur != 0 && !ProgressBar_IsDragging())
   {
     uint32_t cur = Music_GetCurrentPlayTime();
 
@@ -253,7 +285,7 @@ void setup()
 
 void loop()
 {
-  // 串口命令（只剩诊断用；校准界面已移除）
+  // 串口命令：诊断 + 触摸校准
   while (Serial.available() > 0)
   {
     int ch = Serial.read();
@@ -262,6 +294,16 @@ void loop()
       // 诊断：打印当前标定 + 一次实测换算，用来判断错位原因
       Touch_DumpDebug();
     }
+    else if (ch == 'c' || ch == 'C')
+    {
+      // 开始触摸校准（屏幕显示十字标，逐个触摸）
+      TouchCal_Start();
+    }
+    else if (ch == 'x' || ch == 'X')
+    {
+      // 取消正在进行的校准
+      TouchCal_Cancel();
+    }
     else if (ch == '\r' || ch == '\n')
     {
       // 忽略行尾
@@ -269,7 +311,10 @@ void loop()
   }
 
   lv_timer_handler(); /* let the GUI do its work */
+  PerfOverlay_Loop(); // 性能浮窗（-DENABLE_PERF_OVERLAY=1 时才真正干活）
   PlaylistTool_Poll(); // BOOT 键 + 重建进度（内部按小片推进扫描，不阻塞）
+  SdHotplug_Poll();    // SD 卡热插拔：拔卡/插卡自动识别 + 浮窗提醒
+  TouchCal_Poll();     // 触摸校准采样状态机（未校准时立即返回）
 
   /* 重建期间跳过主界面刷新：
      此刻 musicFiles 数组正在被重新分配、fileCount 会在 0 和实际值之间跳，
@@ -280,6 +325,10 @@ void loop()
     UI_update(); // 更新UI
   }
   UI_CheckAudioTaskAlive(); // 解码任务卡死检测（见下）
+  /* 音频链路性能埋点打印（-DENABLE_AUDIO_PROFILE=1 时才真正干活）。
+     刻意放在主循环里、而不是音频任务里：Serial.printf 一行约 13ms，
+     在音频任务里打印会自己制造欠载，测量结果失真。内部按 1 秒节流。 */
+  AudioProfile_Print();
   delay(5);
 }
 // ===== 界面刷新状?=====
@@ -398,7 +447,7 @@ static void UI_ApplyCurrentState(void)
     shownTitle = currentTitle;
     shownArtist = currentArtist;
 
-    lv_label_set_text(ui_MusicLrcLabel, lrc_flag ? "歌词加载中..." : "暂无歌词");
+    lv_label_set_text(ui_MusicLrcLabel, lrc_flag ? "" : "暂无歌词");
 
     // 【必须用 Music_GetDuration()】跨核读取，见 UI_ApplyCurrentState() 中的说明
     long dur = Music_GetDuration();
@@ -488,7 +537,7 @@ static void UI_HandleTrackChange(void)
     /* 3) 歌词：此刻能查到的只有「同名 .lrc」和 /lrc/ 下已生成的文件；
         曲目内嵌歌词要等解码任务解析完，由 UI_update() 里的补查兜底。 */
     parseLrcFile(musicFiles[music_i]);
-    lv_label_set_text(ui_MusicLrcLabel, lrc_flag ? "歌词加载中..." : "暂无歌词");
+    lv_label_set_text(ui_MusicLrcLabel, lrc_flag ? "" : "暂无歌词");
     ui_lrcPlaceholderShown = !lrc_flag;
 
     /* 4) 顶栏立刻给出反馈，让用户知道「点到了」 */
@@ -603,7 +652,7 @@ void UI_update()
       if (lrc_flag)
       {
         ui_lrcPlaceholderShown = false;
-        lv_label_set_text(ui_MusicLrcLabel, "歌词加载中...");
+        lv_label_set_text(ui_MusicLrcLabel, "暂无歌词"); // 先清掉占位
         Serial.println("已补查到曲目内嵌歌词（并生成 /lrc 文件）");
       }
       else
@@ -670,8 +719,11 @@ void UI_update()
     /* 只有「曲目自然播放结束」才自动切歌。
        必须问音频侧专门的事件标志，而不是从「是否正在播放」反推 ——
        否则正在装载下一首、或用户刚按下暂停时，都会被误判成放完了，
-       于是莫名跳歌、UI 与实际播放状态对不上。 */
-    if (Music_ConsumeEnded())
+       于是莫名跳歌、UI 与实际播放状态对不上。
+       另外必须确认存储卡仍在且列表非空：卡被拔出时列表会被清空（musicFiles
+       已释放），此时即便解码器因读卡失败报了「结束」，也不能去索引一个空的
+       列表 —— 否则会解引用已释放的指针。 */
+    if (Music_ConsumeEnded() && Music_IsStorageReady() && fileCount > 0)
     {
       Serial.println("曲目播放结束，按循环方式切换");
       switch (currentPlayMode)

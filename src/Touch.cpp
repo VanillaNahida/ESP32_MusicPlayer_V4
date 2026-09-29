@@ -3,6 +3,7 @@
 #include <Arduino.h>
 #include <SPI.h>
 #include <XPT2046_Touchscreen.h>
+#include <Preferences.h>
 
 #include "AudioBusLock.h"
 
@@ -139,7 +140,9 @@ static const uint16_t s_height = 320;
    分子分母的负号相消，反向区间能正确换算，无需特殊处理。
    若两者相等会除零，所以 hi==lo 时直接返回 0。
 
-   改这里就是唯一需要改标定的地方（校准界面已移除）。
+   改这里就是改「出厂默认标定」。注意这只在 NVS 里**没有**校准记录时生效：
+   一旦做过一次触摸校准（串口 'c'，见 src/TouchCal.cpp），
+   开机时会由 Touch_LoadCalibration() 用 NVS 里的记录覆盖下面这组默认值。
    ================================================================== */
 static int32_t s_xLeft = 3700;  /* 屏幕 x=0   处的原始值 */
 static int32_t s_xRight = 320;  /* 屏幕 x=239 处的原始值 */
@@ -164,6 +167,130 @@ static int32_t scaleToScreen(int32_t raw, int32_t lo, int32_t hi, int32_t range)
         v = range - 1;
     }
     return v;
+}
+
+/* ==================================================================
+   标定值的校验 / 读写 / NVS 持久化
+   ================================================================== */
+
+/* 合法范围：原始值本身是 0~4095，但标定值是按边缘点**外推**出来的
+   （见 TouchCal.cpp 里的换算），可能略微超出这个区间，所以放宽一些。
+   真正的有效性判据是「两端的跨度足够大」：跨度太小说明采样点挤在一起
+   或被反向，用它换算会把整块屏幕压扁/翻转，必须拒绝。 */
+#define TOUCH_CAL_ABS_LIMIT 2000 /* 允许 [-2000, 4095+2000] */
+#define TOUCH_CAL_MIN_SPAN 200   /* 两端原始值至少差这么多 */
+
+static bool calSanity(int32_t xl, int32_t xr, int32_t yt, int32_t yb)
+{
+    const int32_t lo = -TOUCH_CAL_ABS_LIMIT;
+    const int32_t hi = 4095 + TOUCH_CAL_ABS_LIMIT;
+    if (xl < lo || xl > hi || xr < lo || xr > hi ||
+        yt < lo || yt > hi || yb < lo || yb > hi)
+    {
+        return false;
+    }
+    int32_t dx = xr - xl;
+    int32_t dy = yb - yt;
+    if (dx < 0)
+        dx = -dx;
+    if (dy < 0)
+        dy = -dy;
+    return (dx >= TOUCH_CAL_MIN_SPAN) && (dy >= TOUCH_CAL_MIN_SPAN);
+}
+
+void Touch_GetCalibration(int32_t *xLeft, int32_t *xRight, int32_t *yTop, int32_t *yBottom)
+{
+    if (xLeft)
+        *xLeft = s_xLeft;
+    if (xRight)
+        *xRight = s_xRight;
+    if (yTop)
+        *yTop = s_yTop;
+    if (yBottom)
+        *yBottom = s_yBottom;
+}
+
+bool Touch_SetCalibration(int32_t xLeft, int32_t xRight, int32_t yTop, int32_t yBottom)
+{
+    if (!calSanity(xLeft, xRight, yTop, yBottom))
+    {
+        Serial.printf("[TOUCH] 标定值不合理，拒绝应用: x=%d..%d y=%d..%d\n",
+                      (int)xLeft, (int)xRight, (int)yTop, (int)yBottom);
+        return false;
+    }
+    s_xLeft = xLeft;
+    s_xRight = xRight;
+    s_yTop = yTop;
+    s_yBottom = yBottom;
+    Serial.printf("[TOUCH] 标定已更新: x=%d..%d y=%d..%d\n",
+                  (int)s_xLeft, (int)s_xRight, (int)s_yTop, (int)s_yBottom);
+    return true;
+}
+
+/* NVS 命名空间/键名。改键名会让旧记录读不到（退回默认标定），别随意改。 */
+#define TOUCH_NVS_NS "touch"
+
+static Preferences s_calPrefs;
+static bool s_calPrefsReady = false;
+
+static bool calPrefsEnsure()
+{
+    if (!s_calPrefsReady)
+    {
+        s_calPrefsReady = s_calPrefs.begin(TOUCH_NVS_NS, false);
+        if (!s_calPrefsReady)
+        {
+            Serial.println("[TOUCH] NVS 打开失败（namespace=touch），标定无法持久化");
+        }
+    }
+    return s_calPrefsReady;
+}
+
+bool Touch_LoadCalibration(void)
+{
+    if (!calPrefsEnsure())
+    {
+        return false;
+    }
+    // 没有记录 → 保持文件顶部的默认标定
+    if (!s_calPrefs.isKey("xl"))
+    {
+        return false;
+    }
+
+    int32_t xl = s_calPrefs.getInt("xl", s_xLeft);
+    int32_t xr = s_calPrefs.getInt("xr", s_xRight);
+    int32_t yt = s_calPrefs.getInt("yt", s_yTop);
+    int32_t yb = s_calPrefs.getInt("yb", s_yBottom);
+
+    if (!calSanity(xl, xr, yt, yb))
+    {
+        Serial.println("[TOUCH] NVS 中的标定无效，沿用默认标定");
+        return false;
+    }
+
+    s_xLeft = xl;
+    s_xRight = xr;
+    s_yTop = yt;
+    s_yBottom = yb;
+    Serial.printf("[TOUCH] 已从 NVS 载入标定: x=%d..%d y=%d..%d\n",
+                  (int)s_xLeft, (int)s_xRight, (int)s_yTop, (int)s_yBottom);
+    return true;
+}
+
+bool Touch_SaveCalibration(void)
+{
+    if (!calPrefsEnsure())
+    {
+        return false;
+    }
+    s_calPrefs.putInt("xl", s_xLeft);
+    s_calPrefs.putInt("xr", s_xRight);
+    s_calPrefs.putInt("yt", s_yTop);
+    s_calPrefs.putInt("yb", s_yBottom);
+    Serial.printf("[TOUCH] 标定已保存到 NVS: x=%d..%d y=%d..%d\n",
+                  (int)s_xLeft, (int)s_xRight, (int)s_yTop, (int)s_yBottom);
+    return true;
 }
 
 
@@ -271,11 +398,13 @@ void Touch_Init(void)
     pinMode(TOUCH_CS, OUTPUT);
     digitalWrite(TOUCH_CS, HIGH);
 
-    /* 标定值直接使用文件顶部那组项目实测值，不再读 NVS / SD，也不再进校准界面。
-       好处：开机即用、不依赖 NVS 是否可用、也不会因为「标定页本身点不动」而卡死。 */
-    Serial.printf("[TOUCH] 标定 x=%d..%d y=%d..%d (屏 %ux%u, rotation=%d)\n",
+    /* 标定值：优先用 NVS 里的校准记录；没有/无效时沿用文件顶部那组实测默认值。
+       所以「从没校准过」也能开机即用，而校准过之后重启依然生效。 */
+    bool fromNvs = Touch_LoadCalibration();
+    Serial.printf("[TOUCH] 标定 x=%d..%d y=%d..%d (屏 %ux%u, rotation=%d, 来源=%s)\n",
                   (int)s_xLeft, (int)s_xRight, (int)s_yTop, (int)s_yBottom,
-                  (unsigned)s_width, (unsigned)s_height, TOUCH_ROTATION);
+                  (unsigned)s_width, (unsigned)s_height, TOUCH_ROTATION,
+                  fromNvs ? "NVS" : "默认值");
 
     s_inited = true;
 
@@ -304,13 +433,18 @@ void Touch_Init(void)
 }
 
 /* ==================================================================
-   校准界面相关接口已全部移除。
+   触摸校准（屏幕十字标触摸采样）
 
-   原因：那套「8 点采样 + 存 NVS」的设计依赖触摸本身先能工作 ——
-   而标定不准时，用户根本点不中红点，形成「用错的标定去校准标定」的
-   死锁。项目原本就有一组实测可用的标定值（见文件顶部），
-   直接沿用即可，既无死锁风险，也不依赖 NVS 是否可用。
-   需要改标定时，改文件顶部那 4 个 s_xLeft/s_xRight/s_yTop/s_yBottom。
+   实现在 src/TouchCal.cpp，由主循环的串口命令 'c' 触发。
+
+   和这里曾经那套「8 点采样」的关键区别，也是它当时被删掉的原因：
+   老设计要求用户点中屏幕上的红点**控件**，而这依赖触摸映射已经准确 ——
+   标定不准时点不中红点，形成「用错的标定去校准标定」的死锁。
+   现在改成由**串口**进入校准（不依赖触摸），并且采样的是 Touch_ReadRaw()
+   的**原始值**（不经过当前标定换算），所以无论当前标定多离谱都能校准。
+
+   采样完成后由 TouchCal.cpp 外推出屏幕四边对应的原始值，
+   调用 Touch_SetCalibration() 应用、Touch_SaveCalibration() 存入 NVS。
    ================================================================== */
 
 void Touch_Read(lv_indev_drv_t *drv, lv_indev_data_t *data)

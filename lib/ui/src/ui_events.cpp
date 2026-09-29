@@ -103,17 +103,89 @@ void PlayModeClicked(lv_event_t *e)
 	Serial.println(currentPlayMode);
 }
 
+/* ==================== 音量浮动条：无操作自动收起 ====================
+
+   需求：打开音量面板后，5 秒内没有任何操作就自动收起。
+
+   用一条周期 lv_timer 实现（由 lv_timer_handler() 驱动，也就是主循环），
+   每次 tick 只做一次「距上次操作是否已超过 5 秒」的时间比较。
+   刻意不用 one-shot 定时器 + lv_timer_reset：轮询版本只有一条时间比较，
+   不依赖 LVGL 内部 repeat_count/reset 的语义，改时长也只动一个常量。
+
+   「操作」的定义：
+     · 打开面板        （VolumeClicked）
+     · 拖动滑块改变音量 （VolumeValueChange）
+   两者都会调用 volPanelTouchActivity() 刷新时间戳。 */
+
+#define VOL_PANEL_TIMEOUT_MS 5000
+#define VOL_PANEL_POLL_MS 250
+
+static uint32_t s_volLastActivityMs = 0;
+static lv_timer_t *s_volPanelTimer = nullptr;
+
+static void volPanelTouchActivity(void)
+{
+	s_volLastActivityMs = millis();
+}
+
+static void volPanelTimerCb(lv_timer_t *t)
+{
+	(void)t;
+	/* ⚠ 必须先判 ui_Screen1：打开播放列表页时主界面被销毁（ui_Screen1 = nullptr），
+	   而 ui_VolumePanel 只是它的子对象、指针会变成野指针。
+	   此时若直接对它调 lv_obj_has_flag 就是访问已释放内存。
+	   ui_Screen1 非空 ⇔ 主界面（含音量面板）已被 ui_Screen1_screen_init() 重建过，
+	   指针才是有效的。 */
+	if (ui_Screen1 == nullptr || ui_VolumePanel == nullptr ||
+		lv_obj_has_flag(ui_VolumePanel, LV_OBJ_FLAG_HIDDEN))
+	{
+		return;
+	}
+	// millis() 回绕由无符号相减自动处理
+	if ((millis() - s_volLastActivityMs) >= VOL_PANEL_TIMEOUT_MS)
+	{
+		lv_obj_add_flag(ui_VolumePanel, LV_OBJ_FLAG_HIDDEN);
+	}
+}
+
+// 定时器延迟到第一次打开面板时才创建：没开过音量条的会话不需要它
+static void volPanelEnsureTimer(void)
+{
+	if (s_volPanelTimer == nullptr)
+	{
+		s_volPanelTimer = lv_timer_create(volPanelTimerCb, VOL_PANEL_POLL_MS, nullptr);
+	}
+}
+
 void VolumeClicked(lv_event_t *e)
 {
-	// 1、获取音量值
+	// 打开面板即视为一次操作：刷新计时起点，并确保自动收起定时器已就绪
+	volPanelEnsureTimer();
+	volPanelTouchActivity();
 
-	// 2、音量值显示到滑块
+	// 1、获取音量值
+	// 2、把当前实际音量同步到滑块 + 数值标签
 	lv_slider_set_value(ui_VolumeSlider, getVolume(), LV_ANIM_OFF);
+
+	/* ⚠ 数值标签必须在这里**显式**刷新，不能指望 ui_event_VolumeSlider 的
+	   LV_EVENT_VALUE_CHANGED 分支替我们做：
+
+	   lv_slider_set_value() 内部走的是 lv_bar_set_value()，而 LVGL 8 的
+	   lv_bar_set_value() 只「改数值 + invalidate」，**不发**
+	   LV_EVENT_VALUE_CHANGED —— 那个事件只在用户用输入设备拖动滑块时才发。
+	   （见 lib/lvgl/src/widgets/lv_bar.c 的 lv_bar_set_value()。）
+
+	   所以只调 set_value 的结果是：滑块位置更新成实际音量，但标签一直停在
+	   SquareLine 设计期的默认值「15」，看起来就像音量没被记住。 */
+	_ui_slider_set_text_value(ui_VolumeValueLabel, ui_VolumeSlider, "", "");
 }
 
 void VolumeValueChange(lv_event_t *e)
 {
 	lv_obj_t *slider = lv_event_get_target(e);
+
+	// 拖动滑块也算一次操作：重置音量条的自动收起计时
+	volPanelTouchActivity();
 
 	// 2. 获取当前滑块值
 	int32_t volume = lv_slider_get_value(slider);
@@ -316,7 +388,7 @@ static lv_obj_t *plMakeRow(lv_obj_t *parent)
 
 	// 右：名称
 	lv_obj_t *txt = lv_label_create(row);
-	lv_obj_set_style_text_font(txt, &ui_font_AlibabaPuHuiTi_12, LV_PART_MAIN);
+	lv_obj_set_style_text_font(txt, FontManager_GetFont(), LV_PART_MAIN);
 	lv_label_set_text(txt, "");
 	lv_label_set_long_mode(txt, LV_LABEL_LONG_DOT); // 太长的名字截断成 "..."，不做跑马灯
 	lv_obj_set_flex_grow(txt, 1);
@@ -640,7 +712,7 @@ static lv_obj_t *plMakeButton(lv_obj_t *parent, const char *text, int x, int w, 
 
 	lv_obj_t *label = lv_label_create(btn);
 	lv_label_set_text(label, text);
-	lv_obj_set_style_text_font(label, &ui_font_AlibabaPuHuiTi_12, LV_PART_MAIN | LV_STATE_DEFAULT);
+	lv_obj_set_style_text_font(label, FontManager_GetFont(), LV_PART_MAIN | LV_STATE_DEFAULT);
 	lv_obj_center(label);
 	return btn;
 }
@@ -821,7 +893,7 @@ static void plOpen(PlMode mode)
 	lv_obj_set_width(ui_plPathLabel, 176);
 	lv_obj_set_pos(ui_plPathLabel, 62, 8);
 	lv_label_set_long_mode(ui_plPathLabel, LV_LABEL_LONG_SCROLL_CIRCULAR);
-	lv_obj_set_style_text_font(ui_plPathLabel, &ui_font_AlibabaPuHuiTi_12, LV_PART_MAIN | LV_STATE_DEFAULT);
+	lv_obj_set_style_text_font(ui_plPathLabel, FontManager_GetFont(), LV_PART_MAIN | LV_STATE_DEFAULT);
 	lv_obj_set_style_text_color(ui_plPathLabel, lv_color_hex(0x8FB8CE), LV_PART_MAIN | LV_STATE_DEFAULT);
 
 	// 滚动容器：不设布局，行对象自己绝对定位（见文件头的虚拟列表说明）
@@ -907,4 +979,183 @@ void PlayListButtonClicked(lv_event_t *e)
 void ui_event_Image1(lv_event_t *e)
 {
 	plOpen(PL_MODE_BROWSE);
+}
+
+/* ==================== 进度条拖动调进度 ====================
+
+   【交互设计】
+     · 按住 / 拖动：滑块实时跟手，时间标签显示拖动到的位置
+     · 松手：才真正跳转
+
+   为什么松手才跳转、而不是拖动过程中持续跳：
+   每次跳转都要「重开整个解码器」（按字节位置重新装载，见 Music.cpp 里
+   Music_SeekToMs 的说明）。拖动过程中每帧都跳的话，会不停地
+   new/delete 解码链 + 反复读 SD 卡，SD 和 SPI 总线压力极大，
+   表现就是拖动时卡顿、爆音，甚至把 UI 拖死。松手跳一次最稳。
+
+   【拖动期间必须挡住解码进度回写】
+   UI_update() 每次都会用 Music_GetCurrentPlayTime() 覆盖进度条和时间标签。
+   如果不挡，拖动时会出现「手滑到 2:30，进度条却每 5ms 被拉回 1:05」
+   的抖动 —— 手指和进度条打架。
+   挡的办法是 s_progressDragging 这个标志，UI_update() 看到它就跳过更新。 */
+static bool s_progressDragging = false;
+
+// 供 UI_update() 查询：当前是否正在拖动进度条
+bool ProgressBar_IsDragging(void)
+{
+	return s_progressDragging;
+}
+
+/* 记录最后一次在 PRESSED/PRESSING 里算出的秒数。
+
+   【为什么不能只在松手时算一次】
+   原来只在 LV_EVENT_RELEASED 里调 pbPosToSeconds() 取位置，
+   实机表现为「松手后歌曲从头开始放」—— 说明那一刻算出来是 0。
+   而 RELEASED 事件里 lv_indev_get_act() 返回的指针/坐标并不可靠
+   （指针设备在 release 路径上 act_point 可能已被复位）。
+
+   改成：按下和拖动过程中每次算出的值都存下来，松手时直接用最后
+   记下的那个。拖动时本来就在持续更新，所以这就是用户松手那一刻
+   看到的位置 —— 既准确又不依赖松手瞬间的指针状态。 */
+static uint32_t s_dragLastSec = 0;
+
+/* 由 LVGL 的指针坐标换算出「拖到了第几秒」。
+   返回 false 表示这次拿不到有效位置（此时调用方应沿用上一次的值）。 */
+static bool pbPosToSeconds(lv_obj_t *bar, uint32_t *outSec)
+{
+	lv_indev_t *indev = lv_indev_get_act();
+	if (indev == NULL)
+	{
+		return false;
+	}
+
+	lv_point_t p;
+	lv_indev_get_point(indev, &p);
+
+	// 把屏幕坐标转到进度条自己的坐标系
+	lv_area_t a;
+	lv_obj_get_coords(bar, &a);
+	const lv_coord_t w = a.x2 - a.x1;
+	if (w <= 0)
+	{
+		return false;
+	}
+
+	// 夹到 0~w：手指滑出进度条左右两端时按端点算，不产生负数/越界
+	lv_coord_t rel = p.x - a.x1;
+	if (rel < 0)
+	{
+		rel = 0;
+	}
+	if (rel > w)
+	{
+		rel = w;
+	}
+
+	const long dur = Music_GetDuration();
+	if (dur <= 0)
+	{
+		return false;
+	}
+	*outSec = (uint32_t)((int64_t)dur * rel / w);
+	return true;
+}
+
+void ui_event_ProgressBar(lv_event_t *e)
+{
+	const lv_event_code_t code = lv_event_get_code(e);
+	lv_obj_t *bar = lv_event_get_target(e);
+
+	if (code == LV_EVENT_PRESSED)
+	{
+		s_progressDragging = true; // 先置位，避免 UI_update() 抢一帧覆盖
+		/* 按下时以当前位置为起点。
+		   这样即使之后的 PRESSING 一次都没拿到有效坐标
+		   （比如一按就松、没产生拖动），松手时也不会跳到 0 ——
+		   而是"原地不动"，符合直觉。 */
+		s_dragLastSec = Music_GetCurrentPlayTime();
+
+		uint32_t sec = 0;
+		if (pbPosToSeconds(bar, &sec))
+		{
+			s_dragLastSec = sec;
+			const long dur = Music_GetDuration();
+			if (dur > 0)
+			{
+				lv_bar_set_value(bar, (int32_t)((int64_t)sec * 100 / dur), LV_ANIM_OFF);
+				lv_label_set_text_fmt(ui_MusicTimeLabel1, "%02u:%02u",
+									  (unsigned)(sec / 60), (unsigned)(sec % 60));
+			}
+		}
+	}
+	else if (code == LV_EVENT_PRESSING)
+	{
+		/* ⚠ s_progressDragging 已经在 PRESSED 里置位了，这里**绝不能**
+		   因为取不到坐标就提前 return 而不解除它 ——
+		   那样这个标志会永久停在 true，UI_update() 从此再也不用真实
+		   播放位置刷新进度条，表现就是「拖过一次之后进度条彻底卡死」。
+		   所以这里只是「本次不更新显示」，拖动状态保持。 */
+		uint32_t sec = 0;
+		if (!pbPosToSeconds(bar, &sec))
+		{
+			return; // 保持上一帧的显示，拖动状态不变
+		}
+		s_dragLastSec = sec; // 记下来给 RELEASED 用
+
+		// 实时预览：进度条跟手 + 左侧时间标签显示拖动位置
+		// （不用 lv_bar_set_value 的动画，否则滑块会滞后于手指）
+		const long dur = Music_GetDuration();
+		if (dur > 0)
+		{
+			lv_bar_set_value(bar, (int32_t)((int64_t)sec * 100 / dur), LV_ANIM_OFF);
+			lv_label_set_text_fmt(ui_MusicTimeLabel1, "%02u:%02u",
+								  (unsigned)(sec / 60), (unsigned)(sec % 60));
+		}
+	}
+	else if (code == LV_EVENT_RELEASED)
+	{
+		/* 用拖动过程中最后记下的位置，而不是在这里重新取指针坐标 ——
+		   原因见 s_dragLastSec 的说明（实机就是这里算出了 0，
+		   导致「松手后从头开始放」）。 */
+		const uint32_t sec = s_dragLastSec;
+
+		/* 必须先解除拖动状态，再发起跳转：
+		   跳转是异步的（置意图、由解码任务下一轮执行），
+		   如果这时还留着 true，UI_update() 会一直不刷新进度条，
+		   而解码任务那边因为重新装载需要时间，用户看到的就是
+		   「松手后进度条不动了」。 */
+		s_progressDragging = false;
+		Serial.printf("[SEEK] 松手 -> 跳转到 %u 秒\n", (unsigned)sec);
+		Music_SeekToMs(sec * 1000u);
+	}
+	else if (code == LV_EVENT_PRESS_LOST)
+	{
+		/* 手指滑出控件范围会触发这个事件。
+		   此时**不跳转**，只是结束拖动状态（当成取消）。
+		   否则"误触进度条再滑开"会莫名其妙跳转，很讨厌。
+		   同时把拖动期间被改掉的进度条/时间标签交还给 UI_update()：
+		   解除标志后它下一轮就会用真实播放位置覆盖回来。 */
+		s_progressDragging = false;
+	}
+}
+
+/* 黑胶唱片区域：打开「歌曲信息」弹层。
+   实现在 src/SongInfo.cpp —— 它需要用 Music_GetCurrentTrackInfo() 汇总
+   标签/时长/文件大小/采样率等十几个字段，那些取数逻辑（跨核读时长、
+   加锁读卡、从 I2S 输出对象取采样率）都属于「音乐」而不属于「界面」，
+   所以放在 src/ 一层，这里只负责把事件转过去。
+
+   为什么用弱符号而不是直接 include：
+   lib/ui 是 SquareLine 生成并手工改过的模块，它编译时 src/ 目录不在头文件
+   搜索路径里，直接 #include "SongInfo.h" 会找不到。用 weak 声明，
+   链接器会自动把 src/SongInfo.cpp 里的强符号接上；
+   万一那个文件被移走，也只是"点了没反应"，不会连编译都过不了。 */
+extern "C" void SongInfo_Open(void) __attribute__((weak));
+
+void ui_event_Jiaopian(lv_event_t *e)
+{
+	if (SongInfo_Open != nullptr)
+	{
+		SongInfo_Open();
+	}
 }

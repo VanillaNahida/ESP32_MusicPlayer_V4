@@ -120,7 +120,7 @@ static void ptMakeButton(lv_obj_t *parent, const char *text, int x, int y,
 
     lv_obj_t *label = lv_label_create(btn);
     lv_label_set_text(label, text);
-    lv_obj_set_style_text_font(label, &ui_font_AlibabaPuHuiTi_12, PT_SEL_MAIN);
+    lv_obj_set_style_text_font(label, FontManager_GetFont(), PT_SEL_MAIN);
     lv_obj_center(label);
 
     if (out != nullptr)
@@ -163,7 +163,7 @@ static void ptBuildDialogFrame(const char *title)
     lv_label_set_text(s_title, title);
     lv_obj_set_style_text_align(s_title, LV_TEXT_ALIGN_CENTER, PT_SEL_MAIN);
     lv_obj_set_style_text_color(s_title, lv_color_hex(0xFFFFFF), PT_SEL_MAIN);
-    lv_obj_set_style_text_font(s_title, &ui_font_AlibabaPuHuiTi_12, PT_SEL_MAIN);
+    lv_obj_set_style_text_font(s_title, FontManager_GetFont(), PT_SEL_MAIN);
 }
 
 static void ptAddBody(const char *text, lv_text_align_t align, int y)
@@ -174,7 +174,7 @@ static void ptAddBody(const char *text, lv_text_align_t align, int y)
     lv_label_set_text(s_body, text);
     lv_obj_set_style_text_align(s_body, align, PT_SEL_MAIN);
     lv_obj_set_style_text_color(s_body, lv_color_hex(0xCFE3EF), PT_SEL_MAIN);
-    lv_obj_set_style_text_font(s_body, &ui_font_AlibabaPuHuiTi_12, PT_SEL_MAIN);
+    lv_obj_set_style_text_font(s_body, FontManager_GetFont(), PT_SEL_MAIN);
 }
 
 /* ---------------- 询问模式 ---------------- */
@@ -243,7 +243,7 @@ static void ptBuildScanUI(const char *title, bool showCancel)
     lv_label_set_text(s_pct, "正在扫描...");
     lv_obj_set_style_text_align(s_pct, LV_TEXT_ALIGN_CENTER, PT_SEL_MAIN);
     lv_obj_set_style_text_color(s_pct, lv_color_hex(0xFFFFFF), PT_SEL_MAIN);
-    lv_obj_set_style_text_font(s_pct, &ui_font_AlibabaPuHuiTi_12, PT_SEL_MAIN);
+    lv_obj_set_style_text_font(s_pct, FontManager_GetFont(), PT_SEL_MAIN);
 
     // 当前正在处理的文件路径（过长时循环滚动）
     s_path = lv_label_create(s_dlg);
@@ -253,7 +253,7 @@ static void ptBuildScanUI(const char *title, bool showCancel)
     lv_label_set_text(s_path, "/");
     lv_obj_set_style_text_align(s_path, LV_TEXT_ALIGN_LEFT, PT_SEL_MAIN);
     lv_obj_set_style_text_color(s_path, lv_color_hex(0x8FB8CE), PT_SEL_MAIN);
-    lv_obj_set_style_text_font(s_path, &ui_font_AlibabaPuHuiTi_12, PT_SEL_MAIN);
+    lv_obj_set_style_text_font(s_path, FontManager_GetFont(), PT_SEL_MAIN);
 
     if (showCancel)
     {

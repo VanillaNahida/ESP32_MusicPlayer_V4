@@ -63,6 +63,14 @@ extern lv_obj_t * ui_TopPanel;
 extern lv_obj_t * ui_Image1;
 // 左上角返回图标（fanhui）：点击后打开文件浏览页。实现在 ui_events.cpp
 void ui_event_Image1(lv_event_t * e);
+// 黑胶唱片区域（jiaopian）：点击后打开「歌曲信息」弹层。实现在 ui_events.cpp
+void ui_event_Jiaopian(lv_event_t * e);
+// 进度条（Bar1）：按住拖动调进度，松手跳转。实现在 ui_events.cpp
+void ui_event_ProgressBar(lv_event_t * e);
+/* 进度条是否正在被拖动。
+   UI_update() 必须查这个：拖动期间不能用解码进度覆盖进度条，
+   否则手指和进度条会互相打架（手滑到 2:30，每 5ms 被拉回 1:05）。 */
+bool ProgressBar_IsDragging(void);
 void ui_event_ImgButton2(lv_event_t * e);
 extern lv_obj_t * ui_ImgButton2;
 extern lv_obj_t * ui_Label2;
@@ -101,6 +109,14 @@ LV_IMG_DECLARE(ui_img_single_loop_png); // assets/SINGLE_LOOP.png
 
 // FONTS
 LV_FONT_DECLARE(ui_font_AlibabaPuHuiTi_12);
+
+/* 运行时字体选择（实现见 src/FontManager.cpp / include/FontManager.h）。
+   返回「当前生效的字体」：SD 卡上的 .bin 字体加载成功则指向它，
+   失败/没插卡则指向内置的 ui_font_AlibabaPuHuiTi_12。
+   界面里所有 lv_obj_set_style_text_font() 都应该用这个函数，
+   而不是直接写 &ui_font_AlibabaPuHuiTi_12 —— 否则那块控件不会跟着换字体。
+   声明放在这里是为了让所有 include "ui.h" 的文件都能直接调，不必再找头文件。 */
+const lv_font_t *FontManager_GetFont(void);
 
 // UI INIT
 void ui_init(void);

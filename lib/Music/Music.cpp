@@ -6,6 +6,9 @@
 #include "AudioGeneratorWAV.h"
 #include "AudioGeneratorFLAC.h"
 #include "AudioGeneratorAAC.h"
+#include "AudioGeneratorM4A.h"  // MP4 容器 + AAC
+#include "AudioGeneratorOGG.h"  // Ogg Vorbis（Tremor）
+#include "AudioGeneratorOpus.h" // Ogg Opus（opusfile）
 #include "AudioOutputI2S.h"
 #include "AudioBusLock.h"
 #include "LyricEncoding.h"
@@ -14,6 +17,7 @@
 #include <vector>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <Preferences.h>
 
 // SD引脚定义
 #define SD_Pin 38
@@ -120,8 +124,65 @@ struct PlaylistHeader
   uint32_t reserved; // 预留
 };
 
-// 音量
+// 音量（范围 0~21；无 NVS 记录时用这个默认值）
 int volume = 15;
+
+/* ==================================================================
+   音量记忆（NVS）
+
+   需求：调好的音量要能实时保存，断电重开后恢复。
+
+   为什么用 NVS 而不是像播放状态那样写 SD 卡上的文件：
+   音量是「随时可能被调」的小状态，而 SD 卡访问必须持 SPI 总线锁、
+   和刷屏/解码抢总线，写卡还会卡住 UI；更要紧的是 SD 卡不可用时
+   （未插卡/初始化失败）音量就该照样记得住。NVS 正好满足：
+   不经过 SPI、与 SD 无关、掉电不丢。
+
+   为什么在 setVolume() 里直接写而不是攒起来定时写：
+   用户明确要求「实时保存」。Preferences 的写入只动一小块 NVS 页，
+   单次耗时在毫秒级；setVolume() 只在**数值真的变化**时才写，
+   滑块拖一遍最多写 21 次（0~21 每档一次），不会造成卡顿或写坏 Flash。
+   ================================================================== */
+static Preferences s_volPrefs;
+static bool s_volPrefsReady = false;
+
+static bool volPrefsEnsure()
+{
+  if (!s_volPrefsReady)
+  {
+    s_volPrefsReady = s_volPrefs.begin("player", false);
+    if (!s_volPrefsReady)
+    {
+      Serial.println("[VOL] NVS 打开失败（namespace=player），音量将不会被记忆");
+    }
+  }
+  return s_volPrefsReady;
+}
+
+void Music_LoadVolume()
+{
+  if (!volPrefsEnsure())
+  {
+    return;
+  }
+  uint8_t v = s_volPrefs.getUChar("vol", (uint8_t)volume);
+  if (v > 21)
+  {
+    v = 21;
+  }
+  volume = v;
+  Serial.printf("[VOL] 已从 NVS 恢复音量 = %d\n", volume);
+}
+
+void Music_SaveVolume()
+{
+  if (!volPrefsEnsure())
+  {
+    return;
+  }
+  s_volPrefs.putUChar("vol", (uint8_t)volume);
+  Serial.printf("[VOL] 音量：%d\n", volume);
+}
 
 // 动态音乐数组
 String* musicFiles = nullptr;
@@ -175,6 +236,60 @@ static uint32_t s_loadAudioMs = 0;         // 本次装载累计「已成功解�
 static char s_currentPath[256] = {0};      // 最近一次成功装载的路径
 static char s_reloadPath[256] = {0};       // 待重载的路径
 static volatile bool s_needReload = false; // 是否需要在下一轮重新装载
+
+/* ==================================================================
+   拖动进度条 → 跳转播放位置（seek）
+
+   【为什么 seek 要「重开解码器」而不是调某个 seek() 接口】
+
+   ESPAudio 的解码器**没有**对外暴露跳转能力：
+     · AudioGenerator 基类里根本没有 seek() 虚函数，只有 begin/loop/stop；
+     · 各解码器内部确实有 file->seek()，但那都是它自己为了回退读取位置
+       用的（如 MP3 读 Xing 头后回退、FLAC 的 seek_cb 回调），
+       不对调用方开放，也没法用来做「跳到第 N 秒」。
+   要在帧级跳转就得改 vendored 的三个解码器（还要处理 mad_synth 内部
+   状态、Xing 头已消费、FLAC 的 decoder state 等），改动面大、回归风险高。
+
+   这里采用的做法：**按字节位置重新装载**。
+     目标字节 = 文件大小 × (目标秒数 / 总秒数)
+   然后把文件指针挪到那里，再重建解码器从该处继续解。
+   对 CBR（固定码率）MP3、WAV、FLAC 误差很小（<1 秒）；
+   VBR（可变码率）MP3 因为是按平均码率估算，可能有几秒偏差 ——
+   这是这个方案的已知代价，换来的是零解码器改动。
+
+   【为什么不用命令队列】
+   和装载/停止一样属于「重活」，必须由解码任务来做（它会 new/delete
+   整个解码链），所以走 s_seekReqMs 这个 volatile 意图 + 主循环落实，
+   理由见上面「UI → 解码任务的命令通道」的说明。
+   ================================================================== */
+/* ================= 播放进度的时间基准（跨核安全） =================
+
+   【为什么这几行必须放在临界区里读】
+   进度 = (now - s_playStartMs - s_pausedMs) + s_seekBaseMs
+   其中 s_playStartMs / s_pausedMs / s_seekBaseMs 全由解码任务(core0)写、
+   由 UI(core1)读。它们是**一组**必须一致的数据：
+
+   跳转时解码任务会先把 s_seekBaseMs 改成目标位置（比如 478296 ms），
+   紧接着才把 s_playStartMs 置成 millis()。如果 UI 正好在这个空隙里读，
+   就会拿到「新的 seekBase + 旧的 playStart」，算出来是
+       (now - 旧playStart) + 478296
+   当旧 playStart 比 now 还大（刚换过歌/刚跳转过），前半段按 uint32
+   下溢成一个极大的值，最终显示成 **71574:49** 这种荒唐时长
+   （4294489 秒 ≈ 2^32 ms / 1000，正是无符号下溢的特征）。
+
+   所以读取时必须整组原子化。portMUX 是递归自旋锁，
+   保护区间极短（只做几次减法），不影响实时性。 */
+static portMUX_TYPE s_timeMux = portMUX_INITIALIZER_UNLOCKED;
+
+static volatile bool s_needSeek = false;   // 是否有待处理的跳转请求
+static volatile uint32_t s_seekReqMs = 0;  // 目标位置（毫秒）
+static uint32_t s_seekBaseMs = 0;          // 跳转起点在整首歌里的偏移（毫秒）
+
+/* 原地跳转（FLAC）后的「一次性宽限」标志。
+   见 Music_Loop() 里 !ok 分支的说明：
+   跳转后如果很快就播完（目标靠近文件尾），不能被误判成
+   「装载哑火」而自动重载回开头。 */
+static bool s_seekGraceOnce = false;
 
 /* ==================================================================
    UI → 解码任务的命令通道
@@ -231,6 +346,7 @@ static QueueHandle_t s_loadQueue = nullptr;
 static char s_metaTitle[256] = {0};
 static char s_metaArtist[256] = {0};
 static char s_metaAlbum[256] = {0};
+static char s_metaComposer[256] = {0}; // 作曲家（TCOM / COMPOSER）
 static volatile bool s_metaDirty = false;
 
 /* 本曲内嵌歌词（ID3 的 USLT / v2.2 的 ULT 帧），UTF-8。
@@ -360,6 +476,15 @@ static void audioMetadataCB(void *cbData, const char *type, bool isUnicode, cons
     s_metaAlbum[sizeof(s_metaAlbum) - 1] = 0;
     s_metaDirty = true;
   }
+  else if (tag.equalsIgnoreCase("TCOM") || tag.equalsIgnoreCase("TCM") ||
+           tag.equalsIgnoreCase("composer"))
+  {
+    /* 作曲家。ID3v2 里是 TCOM，v2.2 是 TCM；FLAC 的 Vorbis comment 用
+       COMPOSER。以前没接这个标签，「歌曲信息」里就一直是空的。 */
+    strncpy(s_metaComposer, string, sizeof(s_metaComposer) - 1);
+    s_metaComposer[sizeof(s_metaComposer) - 1] = 0;
+    s_metaDirty = true;
+  }
   else if (tag.equalsIgnoreCase("tlen") || tag.equalsIgnoreCase("TLEN"))
   {
     long ms = atol(string);
@@ -444,33 +569,112 @@ static void audioDoStop()
   releaseAudio();
   s_decPaused = false;
   s_decEnded = false;
+  /* 时间基准整组清零（原子，见 s_timeMux）。
+     ⚠ s_pauseStartMs 也必须清：它若留着上一次的旧值，
+       applyPauseIntent() 恢复播放时那句 `now - s_pauseStartMs`
+       会算出一个巨大的差值并累加进 s_pausedMs，
+       进而让进度计算下溢成 71574:49。 */
+  portENTER_CRITICAL(&s_timeMux);
   s_playStartMs = 0;
   s_pausedMs = 0;
+  s_pauseStartMs = 0;
+  /* 一起清掉跳转基准与待处理的跳转请求。
+     不清基准的话：停在中间→停止→再放另一首，进度条会带着上一首的
+     偏移量继续数（比如新歌刚开始就显示 1:30）。
+     不清请求的话：停止后那个还没被解码任务处理的跳转会被执行，
+     而 s_currentPath 可能已经变了，就会跳到错误的曲目上。 */
+  s_seekBaseMs = 0;
+  portEXIT_CRITICAL(&s_timeMux);
+  s_needSeek = false;
+  /* 宽限标志是「针对某一次跳转」的，换歌/停止后必须清掉，
+     否则下一首如果恰好一帧没解出来，会被这个残留标志当成正常结束。 */
+  s_seekGraceOnce = false;
 }
 
-/* 装载并开始播放指定曲目（只能由解码任务调用） */
-static void audioDoLoad(const char *path)
+/* 装载并开始播放指定曲目（只能由解码任务调用）。
+
+   startByte > 0 时表示「从文件该字节位置开始解码」—— 这是拖动进度条
+   跳转的实现方式（见上面 seek 的说明）。此时还会配合 s_seekBaseMs，
+   把时间基准挪到跳转点，否则 UI 上的进度会从 0 重新开始数。
+
+   keepPicture = true 表示「这是同一首歌的跳转，不要丢掉已解析的封面」。
+   ⚠ 见下面 releasePicture() 处的说明：跳转时清封面会让封面在界面上消失。 */
+static void audioDoLoadFrom(const char *path, uint32_t startByte, uint32_t seekBaseMs,
+                            bool keepPicture)
 {
   releaseAudio();
-  // 切歌：释放上一首的专辑封面缓冲，新封面解析到后 UI 会自动替换
-  AudioFileSourceID3::releasePicture();
+  /* 【切歌才释放封面；跳转时保留】
+     原来这里无条件调用 releasePicture()，而 releasePicture() 会把
+     AlbumArtStore 里的封面数据清掉，于是 UI 那边
+     Music_GetAlbumCover() 立刻返回 false → 走「显示默认封面」分支
+     → **封面在拖动进度条的一瞬间就没了**。
+
+     为什么不靠「重载时重新解析封面」来自愈：
+       MP3/AAC 的封面在 ID3v2 标签里（文件最开头），WAV 在 LIST 块里。
+       跳转是把文件指针挪到**中间**再重建解码器，那些头根本不会被再读到，
+       所以重载后封面回不来 —— 这就是「部分情况下封面丢失」的成因
+       （FLAC 走原地 seek 不重载，所以不受影响，表现成"部分情况"）。
+
+     保留即可：同一首歌的封面本来就是同一张，跳转不改变它。
+     真正切歌时（keepPicture == false）照旧释放，让新封面有机会解析。 */
+  if (!keepPicture)
+  {
+    AudioFileSourceID3::releasePicture();
+  }
 
   s_decPaused = false;
   s_decEnded = false;
   /* 【不要在这里清 s_wantPaused】
      用户的「暂停」意图必须跨换曲保留，否则「暂停中点下一曲」会突然出声。
      开机时的默认值是 false（即播放），由 Music_RestorePlayState() 显式保证。 */
+  /* 时间基准整组原子改写（见 s_timeMux）：
+     这几项一起决定 UI 算出来的播放进度，必须让 UI 要么全看到旧值、
+     要么全看到新值，不能看到中间态。 */
+  portENTER_CRITICAL(&s_timeMux);
   s_pausedMs = 0;
   s_pauseStartMs = 0;
   s_playStartMs = millis();
-  Music_SetDuration(0); // 切歌先清零，等 Xing/ID3 回调送来新时长
-  durationPrinted = false;
-  s_metaTitle[0] = 0;
-  s_metaArtist[0] = 0;
-  s_metaAlbum[0] = 0;
-  // 清掉上一首的内嵌歌词，等新曲目的 USLT 回调重新填充
-  s_id3LrcReady = false;
-  s_id3Lrc[0] = 0;
+  /* 时间基准：正常从头播是 0；跳转后是目标位置。
+     Music_GetCurrentPlayTime() 会在这个基准上累加实际播放时长，
+     所以跳转后进度条会从目标位置继续走，而不是从 0 重新开始。 */
+  s_seekBaseMs = seekBaseMs;
+  portEXIT_CRITICAL(&s_timeMux);
+  /* ⚠ 时长只在「换歌」时清零，跳转时**必须保留**。
+
+     原因：时长来自文件头部的元数据块 ——
+       · FLAC 的 STREAMINFO（total_samples）在文件最开头；
+       · MP3 的 Xing/Info 头也在第一帧。
+     跳转是把文件指针挪到中间再重建解码器，那些头根本不会被再读一次，
+     所以解码器不会再发 tlen 回调。如果这里照样清零，
+     Music_GetDuration() 就永远是 0，后果是一连串的连锁失效：
+       进度条算不出百分比、pbPosToSeconds() 返回失败、
+       再拖也跳不动 —— 表现就是「跳转一次之后进度条就废了」。
+     保留旧值即可：同一首歌的时长本来就没变。 */
+  const bool isSeek = (seekBaseMs > 0) || (startByte > 0);
+  if (!isSeek)
+  {
+    Music_SetDuration(0); // 换歌先清零，等 Xing/ID3 回调送来新时长
+  }
+  durationPrinted = (Music_GetDuration() != 0);
+
+  /* 【跳转时不要清标签与内嵌歌词】
+     和上面「时长要保留」是同一个道理：标题/艺术家/专辑/作曲家/歌词
+     全都来自文件头部的标签块（ID3v2 / Vorbis comment / WAV LIST），
+     而跳转后解码器是从文件中段开始读的，那些块**再也不会被读到**。
+     如果这里清掉：
+       · 界面上歌手/专辑/歌词立刻变空（或退化成文件名）；
+       · 内嵌歌词一旦清掉就再也补不回来（parseLrcFile 的第三级回退失效）。
+     所以只有真正换歌（!isSeek）才清。 */
+  if (!isSeek)
+  {
+    s_metaTitle[0] = 0;
+    s_metaArtist[0] = 0;
+    s_metaAlbum[0] = 0;
+    s_metaComposer[0] = 0;
+    // 清掉上一首的内嵌歌词，等新曲目的 USLT 回调重新填充
+    s_id3LrcReady = false;
+    s_id3Lrc[0] = 0;
+  }
 
   String fullPath = normalizePath(path);
 
@@ -521,6 +725,25 @@ static void audioDoLoad(const char *path)
     return;
   }
 
+  /* 跳转：把文件指针挪到目标字节位置。
+     放在预读校验之后 —— 先确认这个文件真的读得出来，再去算偏移，
+     否则「读不出数据」会被误报成「跳转失败」。
+     ⚠ 必须夹到文件长度以内：目标时间若因四舍五入超过总长
+       （比如拖到最右端），越界会导致解码器立刻 EOF，表现成「一拖就停」。 */
+  if (startByte > 0)
+  {
+    const uint32_t fileSize = (uint32_t)s_source->getSize();
+    uint32_t target = startByte;
+    if (fileSize > 0 && target >= fileSize)
+    {
+      // 留一点余量，避免刚好落在文件末尾
+      target = (fileSize > 4096) ? (fileSize - 4096) : 0;
+    }
+    s_source->seek(target, SEEK_SET);
+    Serial.printf("[AUDIO] 跳转到字节 %u (共 %u)，时间基准 %u ms\n",
+                  (unsigned)target, (unsigned)fileSize, (unsigned)seekBaseMs);
+  }
+
   /* DMA 缓冲 = dma_buf_count × 256 帧。
      8  → 2048 帧 ≈ 46ms 音频
      16 → 4096 帧 ≈ 93ms 音频（当前使用）
@@ -553,12 +776,13 @@ static void audioDoLoad(const char *path)
   AudioFileSource *srcForGen = s_source;
 
   /* 解码器分派：扩展名必须和 isMusicFile() 的收录范围严格对应。
-     注意两点：
-       1) .flac / .wav 用**原始文件源**，不套 AudioFileSourceID3 ——
-          FLAC 的元数据是 Vorbis comment、WAV 的是 LIST/INFO，
-          各自由解码器自己解析并通过 GENINFO 回调交给我们；
-          套 ID3 反而会因为「流偏移 ≠ 文件偏移」把 FLAC 的 seek/tell 搞乱。
-       2) 其它一律按 MP3 处理并套 ID3（MP3/AAC 的标签就是 ID3v2）。 */
+     注意两条规则：
+       1) 只有「标签就是 ID3v2」的格式才套 AudioFileSourceID3（MP3 / AAC）。
+          FLAC / WAV / M4A / OGG / OPUS 的元数据在各自的容器里
+          （Vorbis comment / LIST-INFO / MP4 原子 / OpusTags），
+          由解码器自己解析后经 GENINFO 回调交给我们；
+          给它们套 ID3 反而会因为「流偏移 ≠ 文件偏移」把 seek/tell 搞乱。
+       2) 其余情况一律按 MP3 处理。 */
   const char *decName = "MP3";
   if (lower.endsWith(".wav"))
   {
@@ -569,6 +793,21 @@ static void audioDoLoad(const char *path)
   {
     decName = "FLAC";
     s_generator = new AudioGeneratorFLAC();
+  }
+  else if (lower.endsWith(".m4a"))
+  {
+    decName = "M4A";
+    s_generator = new AudioGeneratorM4A(); // MP4 容器 + AAC（Helix），自带 tlen
+  }
+  else if (lower.endsWith(".ogg"))
+  {
+    decName = "OGG";
+    s_generator = new AudioGeneratorOGG(); // Ogg Vorbis（Tremor 整数解码）
+  }
+  else if (lower.endsWith(".opus"))
+  {
+    decName = "OPUS";
+    s_generator = new AudioGeneratorOpus(); // Ogg 封装 Opus（opusfile）
   }
   else if (lower.endsWith(".aac"))
   {
@@ -607,6 +846,14 @@ static void audioDoLoad(const char *path)
   Serial.printf("[AUDIO] 开始播放: %s\n", fullPath.c_str());
 }
 
+/* 从曲目开头装载（普通换歌走这里）。 */
+static void audioDoLoad(const char *path)
+{
+  /* keepPicture = false：这是真正的换歌，
+     要释放上一首的封面，好让新曲目的封面能被解析出来。 */
+  audioDoLoadFrom(path, 0, 0, false);
+}
+
 // ============== 音乐系统初始化 ==============
 
 // 存储卡是否已就绪（SD.begin 成功）
@@ -636,6 +883,12 @@ void Music_Init()
   {
     s_loadQueue = xQueueCreate(1, sizeof(AudioCmdMsg));
   }
+
+  /* 恢复上次的音量。刻意放在 SD 初始化**之前**：
+     音量记忆不依赖存储卡，卡没插好也应该照样生效。
+     这里只改 volume 变量，真正的 SetGain 会在曲目装载（audioDoLoad）
+     创建 I2S 输出对象时按 volume 应用。 */
+  Music_LoadVolume();
 
   // 复用 TFT_eSPI 已初始化的 SPI 总线，避免两处各自初始化 SPI2 主机导致 SD 读失效
   s_sdReady = SD.begin(SD_Pin, SPI, 10000000);
@@ -680,6 +933,101 @@ bool Music_LoadPlaylistCache()
 
   Serial.printf("成功加载 %d 首歌曲\n", fileCount);
   return true;
+}
+
+/* 清空上一首的曲目信息（歌词/标题/时长等）。定义在本文件后面，
+   这里提前声明，供热插拔清理提前调用。 */
+static void resetCurrentMediaInfo();
+
+/* 投递「重活」命令给解码任务（audioSendCmd）。定义在本文件后面，
+   这里提前声明，供热插拔清理（拔卡时停播）提前调用。 */
+static void audioSendCmd(uint8_t type, const char *path);
+
+/* ================= SD 卡热插拔：运行时探测 / 重连 / 清理 =================
+
+   【探测为什么用「打开根目录」而不是 SD.cardType()】
+   cardType() 只是返回初始化时缓存的 type，不会重新访问卡，卡拔了它照样
+   返回 CARD_SDHC —— 用它做运行时探测会误判。而 SD.open("/") 会真正走
+   FATFS 的 f_opendir，落到 SD 的 SPI 读上：卡在槽里就成功、卡拔了就失败，
+   是可靠的运行时判据。它和普通读文件一样必须持 SPI 总线锁（与 TFT 刷屏互斥）。 */
+bool Music_ProbeStorage()
+{
+  if (!s_sdReady)
+  {
+    return false; // 还没 mount，谈不上「可读」
+  }
+
+  AudioBusLock();
+  File root = SD.open("/", FILE_READ);
+  bool ok = (bool)root; // 目录打开成功即代表介质可读（空槽会快速失败）
+  if (root)
+  {
+    root.close();
+  }
+  AudioBusUnlock();
+  return ok;
+}
+
+/* 重新初始化 SD 卡（SD.end() + SD.begin()）。
+   ⚠ 用于「开机时没插卡 → 之后才插入」这条路径：SDFS::begin() 内部有
+   `if (_pdrv != 0xFF) return true;` 的守卫，不先 end() 根本不会重新 mount。
+   整个 end()/begin() 都在 SPI 总线锁里 —— begin() 里 ff_sd_initialize 走的是
+   SPI beginTransaction（IDF 驱动），与直写寄存器的 TFT 刷屏没有仲裁，必须互斥。 */
+bool Music_ReinitStorage()
+{
+  AudioBusLock();
+  SD.end();
+  delay(20); // 释放旧挂载后稍等，让卡上电稳定
+  bool ok = SD.begin(SD_Pin, SPI, 10000000);
+  AudioBusUnlock();
+
+  s_sdReady = ok;
+  if (ok)
+  {
+    Serial.println("[SD] 存储卡已重新初始化");
+  }
+  else
+  {
+    Serial.println("[SD] 重新初始化失败：卡仍未插入或不可读");
+  }
+  return ok;
+}
+
+/* 卡已被拔出：立即停掉播放，清空播放列表与曲目信息，并标记 SD 不可用。
+   调用方（core1 主循环的 SdHotplug）在这之后应 UI_NotifyScreenRebuilt()，
+   让界面把旧歌名/进度清掉。
+
+   【为什么先停播放再清数组】
+   musicFiles 数组是 UI 线程独有的，但解码任务(core0)持有的是命令消息里
+   **拷贝的一份路径**，不直接引用该数组 —— 所以清数组本身是安全的。
+   真正的风险是：不先停播放的话，解码任务还在对「已拔出的卡」做 open/read，
+   会和下面的重新 init 抢同一张卡同一条总线。先发 STOP 并等它释放，
+   保证清理彻底、界面状态干净。 */
+void Music_HandleCardRemoved()
+{
+  if (s_loadQueue != nullptr)
+  {
+    audioSendCmd(ACMD_STOP, nullptr);
+  }
+  uint32_t t0 = millis();
+  while (s_decRunning && (millis() - t0) < 500)
+  {
+    delay(5);
+  }
+  if (s_decRunning)
+  {
+    Serial.println("[SD] 解码任务未及时释放，仍继续清理（不阻塞主循环）");
+  }
+
+  /* 清空列表：fileCount 归 0、musicFiles 置 null。UI 那边的取歌/自动切歌
+     都以 fileCount > 0 为前提，清成空之后就不会去碰已释放的指针。 */
+  freeMusicArray();
+  music_i = 0;
+  music_prev_i = -1;
+  resetCurrentMediaInfo();
+
+  s_sdReady = false;
+  Serial.println("[SD] 检测到卡被拔出：已停止播放并清空播放列表");
 }
 
 /* 处理一条命令。返回 true 表示这条命令会「重活」（装载/停止），
@@ -732,11 +1080,32 @@ static void applyPauseIntent()
   if (s_wantPaused && !s_decPaused)
   {
     s_decPaused = true;
+    /* 原子写：UI 可能在另一核上读这一组值算进度 */
+    portENTER_CRITICAL(&s_timeMux);
     s_pauseStartMs = millis();
+    portEXIT_CRITICAL(&s_timeMux);
   }
   else if (!s_wantPaused && s_decPaused)
   {
-    s_pausedMs += millis() - s_pauseStartMs;
+    /* 【恢复播放：累计暂停时长】
+       ⚠ 这里必须防两件事，它们是 s_pausedMs 变成天文数字的根源：
+         1) s_pauseStartMs == 0（从没暂停过 / 被 stop() 清过）
+            → millis() - 0 是一个巨大的值，直接累加进 s_pausedMs；
+         2) millis() 回绕或状态错乱导致 now < s_pauseStartMs
+            → uint32 相减下溢。
+       两者都会让 s_pausedMs 变成一个接近 2^32 的数，
+       而 Music_GetCurrentPlayTime() 里 `elapsed = (now - start) - paused`
+       立刻下溢，最终显示成 71574:49（4294489 秒 ≈ 2^32 ms）。
+       所以这里用有符号差值，并且只接受合理的正值。 */
+    const uint32_t nowMs = millis();
+    const uint32_t pauseStart = s_pauseStartMs;
+    int64_t delta = (pauseStart != 0) ? (int64_t)(int32_t)(nowMs - pauseStart) : 0;
+    if (delta > 0)
+    {
+      portENTER_CRITICAL(&s_timeMux);
+      s_pausedMs += (uint32_t)delta;
+      portEXIT_CRITICAL(&s_timeMux);
+    }
     s_decPaused = false;
   }
 }
@@ -772,9 +1141,136 @@ void Music_Loop()
     if (s_reloadPath[0] != 0)
     {
       Serial.printf("[AUDIO] 自动重载: %s\n", s_reloadPath);
-      audioDoLoad(s_reloadPath);
+      /* keepPicture = true：这是**同一首歌**的哑火重载（重新 open 同一路径），
+         不是换歌。如果在这里丢掉封面，用户会在「切歌偶尔没声音」被自动
+         修复的同时发现封面也没了 —— 而且由于重载同样是读文件开头，
+         封面其实能重新解析出来，但那一瞬间的闪烁完全没必要。
+         直接保留更稳。 */
+      audioDoLoadFrom(s_reloadPath, 0, 0, true);
       vTaskDelay(1);
       return;
+    }
+  }
+
+  /* 1.6 拖动进度条跳转。
+
+     分两条路：
+       (a) FLAC：用 libFLAC 的 seek_absolute() **原地精确跳转**。
+           不解码器、不重开文件、不动时长 —— 又快又准（精确到采样点）。
+       (b) 其它格式（MP3/WAV/AAC）：解码器没有 seek 能力，
+           退回「按字节位置重新装载」，这是估算，可能有偏差。
+
+     为什么不再一律重开解码器（上一版的错误做法）：
+       重开会走 audioDoLoadFrom()，而那里会把时长清零等元数据回调。
+       但跳转是把文件指针挪到**中间**，文件头部的 Xing/STREAMINFO 再也不会
+       被读到，于是时长永远是 0 → 进度条算不出百分比、也再跳不动，
+       表现就是「拖过一次之后进度条彻底卡死」。
+       另外对 FLAC 来说，硬跳进帧中间会找不到同步码，
+       解码器直接报错退出，又被「哑火重载」逻辑拉回开头 ——
+       这就是「松手后从头开始放」的第二个原因。
+       现在 FLAC 走原地 seek，这两个问题都不存在了。 */
+  if (!heavyCmd && s_needSeek)
+  {
+    s_needSeek = false;
+    if (s_currentPath[0] != 0)
+    {
+      const uint32_t targetMs = s_seekReqMs;
+      const uint32_t durMs = (uint32_t)Music_GetDuration() * 1000u;
+
+      /* ---- (a) FLAC：精确 seek，不重开解码器 ---- */
+      String lower = s_currentPath;
+      lower.toLowerCase();
+      if (lower.endsWith(".flac") && durMs > 0 && s_decRunning)
+      {
+        AudioGeneratorFLAC *flacGen = (AudioGeneratorFLAC *)s_generator;
+        /* 把时间换算成「第几个采样点」：样本数 = 秒 × 采样率。
+           采样率从输出对象取（解码器 begin 时写在上面）。 */
+        const uint32_t rate = (s_output != nullptr) ? s_output->GetRate() : 0;
+        if (rate > 0)
+        {
+          const uint64_t sample = ((uint64_t)targetMs * (uint64_t)rate) / 1000ULL;
+          if (flacGen->seekToSample(sample))
+          {
+            /* 只挪时间基准，**不动**时长：
+               时长是整首歌的属性，跳转不改变它。
+               ⚠ 这三项必须整组原子改写：UI 线程会同时读它们算进度，
+                 分步写会读到「新 seekBase + 旧 playStart」的撕裂组合，
+                 算出 71574:49 那种下溢值（见 s_timeMux 的说明）。 */
+            portENTER_CRITICAL(&s_timeMux);
+            s_seekBaseMs = targetMs;
+            s_playStartMs = millis();
+            s_pausedMs = 0;
+            s_pauseStartMs = 0;
+            portEXIT_CRITICAL(&s_timeMux);
+            s_decEnded = false;
+            /* 【重置「哑火」计时，但不要动 s_loadRetried】
+               s_loadAudioMs 记的是「本次装载以来累计解出多少音频」。
+               跳转后要从 0 重新累计（新位置是全新的解码过程）。
+               万一跳过去真的解不出声，有下面这层保护兜住：
+               —— 见 s_seekGraceOnce。 */
+            s_loadAudioMs = 0;
+            /* 跳转后第一次「播放结束」直接当正常结束，不做哑火重载：
+               目标若靠近文件尾，可能几十毫秒就播完，那时 s_loadAudioMs
+               还没到 50ms，会被误判成哑火而重载回开头。 */
+            s_seekGraceOnce = true;
+            Serial.printf("[AUDIO] FLAC 精确跳转: %u ms -> 采样点 %llu (采样率 %u)\n",
+                          (unsigned)targetMs, (unsigned long long)sample, (unsigned)rate);
+            vTaskDelay(1);
+            return;
+          }
+          Serial.println("[AUDIO] FLAC seek_absolute 失败，退回字节重载");
+        }
+      }
+
+      /* ---- (b0) 容器格式：不支持按字节跳转，明确忽略 ----
+         OGG / OPUS / M4A 的 begin() 必须从**文件头**开始解析
+         （Ogg 的页结构、MP4 的 moov 原子都在开头）。而下面 (b) 会把文件
+         指针挪到文件中间再重开解码器 —— 对这些格式结果是 begin() 直接失败、
+         整首歌彻底没声。与其静默把播放搞坏，不如明确忽略这次拖动
+         （进度条会弹回原位，用户能看出「这个格式不能拖」）。 */
+      if (lower.endsWith(".ogg") || lower.endsWith(".opus") || lower.endsWith(".m4a"))
+      {
+        Serial.println("[AUDIO] 该格式是容器结构，不支持拖动跳转，已忽略本次 seek");
+        vTaskDelay(1);
+        return;
+      }
+
+      /* ---- (b) 其它格式：按字节位置重新装载 ---- */
+      uint32_t fileSize = 0;
+      {
+        /* 取文件大小要读 SD，必须持 SPI 总线锁（与 TFT 刷屏互斥）。
+           单独一个作用域，避免下面的 audioDoLoadFrom 还持着锁。 */
+        AudioBusLock();
+        File f = SD.open(s_currentPath, FILE_READ);
+        if (f)
+        {
+          fileSize = (uint32_t)f.size();
+          f.close();
+        }
+        AudioBusUnlock();
+      }
+
+      if (fileSize > 0 && durMs > 0)
+      {
+        /* 目标字节 = 文件大小 × (目标时间 / 总时长)。
+           这就是「按平均码率估算位置」，CBR 文件很准，
+           VBR 文件会有几秒偏差（已知代价，见前面的说明）。 */
+        const uint64_t byteOff = ((uint64_t)fileSize * (uint64_t)targetMs) / (uint64_t)durMs;
+        Serial.printf("[AUDIO] 跳转请求: %u ms / %u ms -> 字节 %u (共 %u)\n",
+                      (unsigned)targetMs, (unsigned)durMs,
+                      (unsigned)byteOff, (unsigned)fileSize);
+        /* keepPicture = true：同一首歌跳转，保留已解析的封面。
+           否则封面会立刻消失，而且重载读到的是文件中段、
+           读不到文件头的 ID3/LIST 标签，再也恢复不了。 */
+        audioDoLoadFrom(s_currentPath, (uint32_t)byteOff, targetMs, true);
+        vTaskDelay(1);
+        return;
+      }
+      else
+      {
+        // 时长还没解析出来（刚切歌就拖），没法换算，忽略这次跳转
+        Serial.println("[AUDIO] 跳转失败：时长或文件大小未知");
+      }
     }
   }
 
@@ -868,6 +1364,21 @@ void Music_Loop()
            一首正常的歌至少要出声几百毫秒，我们按「累计出声时长」来判断，
            比数循环次数可靠得多（循环次数受文件长度影响，几秒的歌也可能很少轮）。 */
       const bool everProducedAudio = (s_loadAudioMs >= 50);
+
+      /* 【跳转后第一次结束不算「哑火」】
+         如果跳到的位置靠近文件尾，可能几十毫秒就播完了。
+         这时 s_loadAudioMs 很小、everProducedAudio 为 false，
+         会被误判成「一帧都没解出来」→ 自动重载 → **跳回开头**，
+         正是「拖完进度后从头发开始放」的成因之一。
+         因为原地 seek 并没有重开解码器，这里用一个一次性宽限标志
+         把跳转后的首次结束直接当作正常结束。 */
+      if (s_seekGraceOnce)
+      {
+        s_seekGraceOnce = false;
+        s_decEnded = true;
+        Serial.println("[AUDIO] 跳转后播放结束（正常）");
+        return;
+      }
 
       if (!everProducedAudio && !s_loadRetried)
       {
@@ -984,13 +1495,17 @@ void listMusicFiles(String dir)
 /* 是否是「能被本机解码器播放」的音乐文件。
 
    ⚠ 这里的扩展名必须和 audioDoLoad() 的解码器分派严格一致：
-       .wav  -> AudioGeneratorWAV
+       .mp3  -> AudioGeneratorMP3
        .flac -> AudioGeneratorFLAC
+       .wav  -> AudioGeneratorWAV
        .aac  -> AudioGeneratorAAC
-       其它  -> AudioGeneratorMP3（含 .mp3）
+       .m4a  -> AudioGeneratorM4A   （MP4 容器 + AAC）
+       .ogg  -> AudioGeneratorOGG   （Ogg Vorbis）
+       .opus -> AudioGeneratorOpus  （Ogg Opus）
 
    旧实现收 .wma 却根本没有 WMA 解码分支，选中后必然打不开 ——
    表现就是「点了没反应」，正是这个项目一直在踩的那类坑，所以不再收它。
+   同理：往这里加扩展名时，audioDoLoad() 里必须同时加上对应分支。
 
    另外：扫描器传进来的是完整路径（ESP32 core 3.x 的 File::name() 就是全路径），
    所以要先剥掉目录再判断扩展名，免得目录名里恰好含 ".mp3" 就误判。 */
@@ -1004,7 +1519,9 @@ bool isMusicFile(String name)
   }
   base.toLowerCase();
   return base.endsWith(".mp3") || base.endsWith(".flac") ||
-         base.endsWith(".wav") || base.endsWith(".aac");
+         base.endsWith(".wav") || base.endsWith(".aac") ||
+         base.endsWith(".m4a") || base.endsWith(".ogg") ||
+         base.endsWith(".opus");
 }
 
 /* ================= 供「文件浏览页」使用的路径/目录工具 =================
@@ -1143,6 +1660,134 @@ void Music_CloseDir(void *handle)
   AudioBusLock();
   closedir((DIR *)handle);
   AudioBusUnlock();
+}
+
+/* ================= 曲目详情（歌曲信息弹层用） ================= */
+
+/* 取任意路径对应文件的字节数；失败返回 0。
+   SD 访问要和 TFT 刷屏抢同一条 SPI 总线，必须加锁 —— 调用方（UI 线程）
+   直接调即可，不用自己操心加锁。 */
+uint32_t Music_GetFileSize(const char *path)
+{
+  if (path == nullptr || path[0] == 0)
+  {
+    return 0;
+  }
+  AudioBusLock();
+  File f = SD.open(path, FILE_READ);
+  uint32_t size = 0;
+  if (f)
+  {
+    size = (uint32_t)f.size();
+    f.close();
+  }
+  AudioBusUnlock();
+  return size;
+}
+
+/* 取当前曲目的完整详情。
+
+   各字段来源：
+     title/artist/album        ← s_meta*（解码任务的标签回调写的），空则文件名兜底
+     composer                  ← s_metaComposer（TCOM / COMPOSER 标签）
+     path                      ← musicFiles[music_i]
+     format                    ← 按扩展名判断，与 audioDoLoad() 的分派保持一致
+     durationSec               ← Music_GetDuration()（必须走这个跨核接口）
+     fileSize                  ← 读 SD 卡
+     sampleRate/bits/channels  ← I2S 输出对象（解码器会把它们写在上面）
+     bitrateKbps               ← 由「文件大小 × 8 ÷ 时长」算出
+
+   比特率为什么是算出来的：
+   ESPAudio 的解码器只把比特率 log 出来，没有通过元数据回调发给我们，
+   而且各格式的拿法各不相同（MP3 帧头 / FLAC STREAMINFO / WAV fmt）。
+   但「平均比特率 = 字节数×8 ÷ 秒数」对三种格式都成立，也正好是用户在
+   文件属性里看到的那个数（VBR 文件尤其如此），所以直接算更省事也更准。
+   ⚠ 刚切歌、时长还没解析出来时算不出，返回 0，UI 显示「未知」。 */
+bool Music_GetCurrentTrackInfo(struct TrackInfo *info)
+{
+  if (info == nullptr)
+  {
+    return false;
+  }
+  memset(info, 0, sizeof(*info));
+
+  if (fileCount <= 0 || music_i < 0 || music_i >= fileCount)
+  {
+    return false;
+  }
+
+  const String &full = musicFiles[music_i];
+
+  /* 标题/艺术家/专辑：先让 Music_info() 把标签回调攒下的 s_meta*
+     落实到 currentTitle/currentArtist/currentAlbum，并做好文件名兜底。
+     注意 Music_info() 是 UI 线程专用（它读跨核变量并做兜底），
+     本函数也只应由 UI 线程调用。 */
+  Music_info();
+
+  strncpy(info->title, currentTitle.c_str(), sizeof(info->title) - 1);
+  strncpy(info->artist, currentArtist.c_str(), sizeof(info->artist) - 1);
+  strncpy(info->album, currentAlbum.c_str(), sizeof(info->album) - 1);
+  strncpy(info->composer, s_metaComposer, sizeof(info->composer) - 1);
+  strncpy(info->path, full.c_str(), sizeof(info->path) - 1);
+
+  // ── 格式：与 audioDoLoad() 的分派规则严格一致 ──
+  String lower = full;
+  lower.toLowerCase();
+  const char *fmt = "MP3";
+  if (lower.endsWith(".wav"))
+  {
+    fmt = "WAV";
+  }
+  else if (lower.endsWith(".flac"))
+  {
+    fmt = "FLAC";
+  }
+  else if (lower.endsWith(".aac"))
+  {
+    fmt = "AAC";
+  }
+  else if (lower.endsWith(".m4a"))
+  {
+    fmt = "M4A";
+  }
+  else if (lower.endsWith(".ogg"))
+  {
+    fmt = "OGG";
+  }
+  else if (lower.endsWith(".opus"))
+  {
+    fmt = "OPUS";
+  }
+  strncpy(info->format, fmt, sizeof(info->format) - 1);
+
+  // ── 时长：必须走跨核接口，直接读全局变量会拿到陈旧值 ──
+  const long dur = Music_GetDuration();
+  info->durationSec = (dur > 0) ? (uint32_t)dur : 0;
+
+  // ── 文件大小：读卡（内部已加 SPI 锁）──
+  info->fileSize = Music_GetFileSize(full.c_str());
+
+  /* ── 采样率 / 位深 / 声道 ──
+     解码器在 begin() 时会把这三个值写到 I2S 输出对象上
+     （见 AudioGeneratorMP3/FLAC/WAV 里的 output->SetRate 等），
+     但**不会**通过元数据回调发出来，所以只能从输出对象读。
+     信息弹层通常在开始播放之后才被打开，那时这些值已经就绪。 */
+  if (s_output != nullptr)
+  {
+    info->sampleRate = (uint32_t)s_output->GetRate();
+    info->bitsPerSample = (uint8_t)s_output->GetBitsPerSample();
+    info->channels = (uint8_t)s_output->GetChannels();
+  }
+
+  // ── 平均比特率 = 字节数 × 8 ÷ 秒数 ÷ 1000 ──
+  if (info->fileSize > 0 && info->durationSec > 0)
+  {
+    const uint64_t bits = (uint64_t)info->fileSize * 8ULL;
+    const uint64_t kbps = bits / (uint64_t)info->durationSec / 1000ULL;
+    info->bitrateKbps = (kbps > 0xFFFFFFFFULL) ? 0xFFFFFFFFu : (uint32_t)kbps;
+  }
+
+  return true;
 }
 
 /* 解析一段 LRC 文本到 lyrics[]。
@@ -1669,9 +2314,54 @@ uint32_t Music_GetCurrentPlayTime()
   {
     return 0;
   }
-  uint32_t now = s_decPaused ? s_pauseStartMs : millis();
-  uint32_t elapsed = now - s_playStartMs - s_pausedMs;
-  return elapsed / 1000;
+
+  /* 【整组原子读取】见 s_timeMux 的说明：
+     s_playStartMs / s_pausedMs / s_seekBaseMs 由解码任务一起改写，
+     分开读会读到「新 seekBase + 旧 playStart」这种撕裂组合，
+     算出 71574:49 那种因 uint32 下溢得到的荒唐值。 */
+  uint32_t startMs, pausedMs, baseMs;
+  portENTER_CRITICAL(&s_timeMux);
+  startMs = s_playStartMs;
+  pausedMs = s_pausedMs;
+  baseMs = s_seekBaseMs;
+  portEXIT_CRITICAL(&s_timeMux);
+
+  const uint32_t now = s_decPaused ? s_pauseStartMs : millis();
+
+  /* 用有符号 32 位做减法再判断正负：
+     uint32 直接相减一旦「减数 > 被减数」就会下溢成一个接近 2^32 的
+     大数，这正是 71574:49 的来源。改成 int64 之后：
+       · millis() 回绕（约 49.7 天）依然正确 —— 无符号差值的语义由
+         int32 解释，等价于「按模 2^32 的最近距离」；
+       · 任何异常情况（时钟抖动、状态撕裂）算出的负数都能被下面的
+         夹取拦住，最坏也只是显示 0，不会出现天文数字。 */
+  int64_t elapsed = (int64_t)(int32_t)(now - startMs) - (int64_t)pausedMs;
+  if (elapsed < 0)
+  {
+    elapsed = 0;
+  }
+
+  /* 加上跳转基准：跳转后解码器是从中间开始解的，
+     必须补上「跳过去的那一段」，否则进度条会从 0 重新开始数。 */
+  int64_t total = elapsed + (int64_t)baseMs;
+  if (total < 0)
+  {
+    total = 0;
+  }
+
+  /* 上限夹取：进度不应超过曲目总时长（时长未知时按 0 处理，
+     即不做上限约束，避免刚开头就把进度压成 0）。 */
+  const long durSec = Music_GetDuration();
+  if (durSec > 0)
+  {
+    const int64_t maxMs = (int64_t)durSec * 1000;
+    if (total > maxMs)
+    {
+      total = maxMs;
+    }
+  }
+
+  return (uint32_t)(total / 1000);
 }
 
 /* 获取当前曲目内嵌的专辑封面（原始图片数据） */
@@ -1688,11 +2378,45 @@ bool Music_GetAlbumCover(const uint8_t **data, size_t *size, uint32_t *revision)
   return (pic != nullptr) && (len > 0);
 }
 
+/* ================= 拖动进度条跳转（seek） =================
+
+   只能在 UI 线程调用。单位是毫秒（0 ~ 曲目总时长）。
+
+   为什么单位用毫秒而不是秒：
+   拖动进度条时滑块位置是连续的，LVGL 给的是 0~100 的百分比。
+   用秒做单位在长曲目上（比如 10 分钟）粒度是 1/600，拖动会一跳一跳；
+   用毫秒可以让换算无損耗，具体精度由下面的字节换算决定。
+
+   这里只置一个 volatile 意图、立刻返回 —— 真正的重开解码器由解码任务
+   在 Music_Loop() 里做（它会 new/delete 整条解码链，绝不能跨核操作）。 */
+void Music_SeekToMs(uint32_t ms)
+{
+  /* 夹到有效范围：拖动松手瞬间、或时长刚好在变（切歌）时，
+     传进来的值可能超过当前时长。越界会让解码器直接 EOF。 */
+  const uint32_t durMs = (uint32_t)Music_GetDuration() * 1000u;
+  if (durMs > 0 && ms > durMs)
+  {
+    /* 留 1 秒余量：拖到最右端时如果正好等于总长，
+       按字节换算会落在文件末尾，解码器读到 EOF 会立刻判定播放结束。 */
+    ms = (durMs > 1000u) ? (durMs - 1000u) : 0u;
+  }
+  s_seekReqMs = ms;
+  s_needSeek = true;
+}
+
 /*播放指定路径下的音频*/
 void Music_PlayPath(const char *path)
 {
   if (path == nullptr)
     return;
+
+  /* 卡被拔出/尚未就绪时拒绝点歌：此时 musicFiles 可能已被清空、甚至已释放，
+     把一条指向已释放内存的命令投递出去只会让解码任务去打开一个不存在的卡。
+     这个守卫同时也保护 UI 的「自动切歌」——卡不在时不会去索引空列表。 */
+  if (!s_sdReady)
+  {
+    return;
+  }
 
   // 只投递命令，实际的对象创建/销毁全部由解码任务完成（跨核安全）
   audioSendCmd(ACMD_LOAD, path);
@@ -1716,9 +2440,17 @@ void setVolume(uint8_t v)
   {
     v = 21;
   }
+  /* 数值没变就直接返回：既避免重复设置增益，也避免把同一个值反复写进 NVS
+     （滑块拖动时同一档可能被上报多次）。 */
+  if (v == (uint8_t)volume)
+  {
+    return;
+  }
   volume = v;
   // 真正的 SetGain 由解码任务执行（音频对象归解码任务所有）
   s_pendingGain = (int)((v * 100) / 21);
+  // 实时持久化：断电重开后按这个值恢复
+  Music_SaveVolume();
 }
 
 /*获取音量值*/

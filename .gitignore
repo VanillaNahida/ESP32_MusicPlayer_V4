@@ -37,7 +37,12 @@ Thumbs.db
 .cache
 .vscode
 
+# Python virtualenv for tools/ (fontTools) — created per README/tool docstrings
+.venv/
+__pycache__/
+
 lib/
 assets/
 .fontgen/
 compile_commands.json
+*.pdf

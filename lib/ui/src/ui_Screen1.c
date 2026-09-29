@@ -62,7 +62,7 @@ void ui_Screen1_screen_init(void)
     lv_obj_set_style_text_opa(ui_MusicTitleLabel, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_letter_space(ui_MusicTitleLabel, 2, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_line_space(ui_MusicTitleLabel, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_text_font(ui_MusicTitleLabel, &ui_font_AlibabaPuHuiTi_12, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_font(ui_MusicTitleLabel, FontManager_GetFont(), LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_anim_speed(ui_MusicTitleLabel, 20, LV_PART_MAIN | LV_STATE_DEFAULT);  /// 设置滚动速度（数值越小越慢）
 
     ui_MusicArtistLabel = lv_label_create(ui_BottomPanel);
@@ -76,7 +76,7 @@ void ui_Screen1_screen_init(void)
     lv_obj_set_style_text_opa(ui_MusicArtistLabel, 200, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_letter_space(ui_MusicArtistLabel, 2, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_line_space(ui_MusicArtistLabel, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_text_font(ui_MusicArtistLabel, &ui_font_AlibabaPuHuiTi_12, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_font(ui_MusicArtistLabel, FontManager_GetFont(), LV_PART_MAIN | LV_STATE_DEFAULT);
 
     ui_MusicLrcLabel = lv_label_create(ui_BottomPanel);
     lv_obj_set_width(ui_MusicLrcLabel, 200);  /// 设置固定宽度，超过此宽度时滚动
@@ -91,7 +91,7 @@ void ui_Screen1_screen_init(void)
     lv_obj_set_style_text_opa(ui_MusicLrcLabel, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_letter_space(ui_MusicLrcLabel, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_line_space(ui_MusicLrcLabel, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_text_font(ui_MusicLrcLabel, &ui_font_AlibabaPuHuiTi_12, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_font(ui_MusicLrcLabel, FontManager_GetFont(), LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_anim_speed(ui_MusicLrcLabel, 20, LV_PART_MAIN | LV_STATE_DEFAULT);  /// 设置滚动速度（数值越小越慢）
 
     ui_Bar1 = lv_bar_create(ui_BottomPanel);
@@ -102,6 +102,18 @@ void ui_Screen1_screen_init(void)
     lv_obj_set_x(ui_Bar1, 0);
     lv_obj_set_y(ui_Bar1, 8);
     lv_obj_set_align(ui_Bar1, LV_ALIGN_CENTER);
+
+    /* 把进度条变成可拖动调进度的控件。
+       SquareLine 生成的 lv_bar 默认不可点，这里加上 CLICKABLE + 拖动/点击事件。
+       命中区从原来的 2px 高扩到 22px（上下各 10px）：
+       2px 的细条手指根本点不中，扩完之后"按哪儿都能拖"。
+       ⚠ 扩的是**命中区**不是控件本身 —— 视觉上进度条还是那条细线。 */
+    lv_obj_add_flag(ui_Bar1, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_ext_click_area(ui_Bar1, 10);
+    lv_obj_add_event_cb(ui_Bar1, ui_event_ProgressBar, LV_EVENT_PRESSED, NULL);
+    lv_obj_add_event_cb(ui_Bar1, ui_event_ProgressBar, LV_EVENT_PRESSING, NULL);
+    lv_obj_add_event_cb(ui_Bar1, ui_event_ProgressBar, LV_EVENT_RELEASED, NULL);
+    lv_obj_add_event_cb(ui_Bar1, ui_event_ProgressBar, LV_EVENT_PRESS_LOST, NULL);
 
     ui_MusicTimeLabel1 = lv_label_create(ui_BottomPanel);
     lv_obj_set_width(ui_MusicTimeLabel1, LV_SIZE_CONTENT);  /// 1
@@ -198,6 +210,16 @@ void ui_Screen1_screen_init(void)
     lv_obj_set_align(ui_jiaopian, LV_ALIGN_CENTER);
     lv_obj_add_flag(ui_jiaopian, LV_OBJ_FLAG_ADV_HITTEST);  /// Flags
     lv_obj_clear_flag(ui_jiaopian, LV_OBJ_FLAG_SCROLLABLE); /// Flags
+    /* 点这块「黑胶唱片」区域打开歌曲信息弹层。
+       绑在这里而不是 ui_haibao（封面）上，有两个原因：
+         1) 封面只有 93x93，而这张唱片底图是 169x164，好点得多；
+         2) 封面在某些歌上会被换成 155x155 的解码位图（见 AlbumArt.cpp），
+            尺寸会变；绑在底图上就不受封面尺寸变化的影响。
+       两个对象是父子同层的兄弟，封面在上层，点封面时命中的仍是本对象
+       所在的区域 —— 但封面默认不可点（lv_img 不带 CLICKABLE），
+       事件会落到下面的唱片图上，所以两种点法都能打开。 */
+    lv_obj_add_flag(ui_jiaopian, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(ui_jiaopian, ui_event_Jiaopian, LV_EVENT_CLICKED, NULL);
 
     ui_haibao = lv_img_create(ui_MidPanel);
     lv_img_set_src(ui_haibao, &ui_img_haibao_png);
@@ -256,7 +278,7 @@ void ui_Screen1_screen_init(void)
     lv_obj_set_style_text_opa(ui_Label2, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_letter_space(ui_Label2, 2, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_line_space(ui_Label2, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_text_font(ui_Label2, &ui_font_AlibabaPuHuiTi_12, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_font(ui_Label2, FontManager_GetFont(), LV_PART_MAIN | LV_STATE_DEFAULT);
 
     ui_caidanPanel = lv_obj_create(ui_Screen1);
     lv_obj_set_width(ui_caidanPanel, 148);
@@ -292,7 +314,7 @@ void ui_Screen1_screen_init(void)
     lv_label_set_text(ui_Label1, "曲目（1/100）");
     lv_obj_set_style_text_color(ui_Label1, lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_opa(ui_Label1, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_text_font(ui_Label1, &ui_font_AlibabaPuHuiTi_12, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_font(ui_Label1, FontManager_GetFont(), LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_border_width(ui_Label1, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
 
     ui_Panel1 = lv_obj_create(ui_caidanPanel);
@@ -336,7 +358,7 @@ void ui_Screen1_screen_init(void)
     lv_label_set_text(ui_VolumeLabel, "音量：");
     lv_obj_set_style_text_color(ui_VolumeLabel, lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_opa(ui_VolumeLabel, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_text_font(ui_VolumeLabel, &ui_font_AlibabaPuHuiTi_12, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_font(ui_VolumeLabel, FontManager_GetFont(), LV_PART_MAIN | LV_STATE_DEFAULT);
 
     ui_VolumeValueLabel = lv_label_create(ui_VolumePanel);
     lv_obj_set_width(ui_VolumeValueLabel, LV_SIZE_CONTENT);  /// 1

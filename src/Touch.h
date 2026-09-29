@@ -84,9 +84,28 @@ bool Touch_ReadRaw(int16_t *x, int16_t *y, int16_t *z);
 void Touch_DumpDebug(void);
 
 /* ------------------------------------------------------------------
-   校准界面与 NVS 存储已移除，直接用 Touch.cpp 顶部的实测标定值。
-   原因见 Touch.cpp 中「校准界面相关接口已全部移除」那段说明。
+   标定的 NVS 持久化
+
+   开机时 Touch_Init() 会自动调用 Touch_LoadCalibration()：
+   有 NVS 记录就用记录，没有/无效就沿用 Touch.cpp 顶部那组实测默认值，
+   所以「从没校准过」也能正常使用。
+
+   校准流程（见 src/TouchCal.cpp）：
+       串口 'c' → 屏幕显示十字标 → 依次触摸 4 点 →
+       推算标定 → Touch_SetCalibration() + Touch_SaveCalibration()。
+
+   采样的是**原始值**、不依赖当前标定是否准确，因此不会出现
+   「用错的标定去校准标定」的死锁。
    ------------------------------------------------------------------ */
+
+/* 读取当前标定（原始值 → 屏幕像素：屏幕 x=0/x=239/y=0/y=319 处的原始值） */
+void Touch_GetCalibration(int32_t *xLeft, int32_t *xRight, int32_t *yTop, int32_t *yBottom);
+/* 设置当前标定（会做范围校验，越界值直接拒绝并返回 false） */
+bool Touch_SetCalibration(int32_t xLeft, int32_t xRight, int32_t yTop, int32_t yBottom);
+/* 从 NVS 载入标定；返回 false 表示没有有效记录（保持当前值不变） */
+bool Touch_LoadCalibration(void);
+/* 把当前标定保存到 NVS；返回是否成功 */
+bool Touch_SaveCalibration(void);
 
 #ifdef __cplusplus
 }

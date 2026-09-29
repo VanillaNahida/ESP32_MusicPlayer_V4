@@ -60,6 +60,25 @@ void Music_Loop();
 bool Music_IsStorageReady();
 // 尝试直接载入播放列表缓存；返回 false 表示需要走一次全卡扫描
 bool Music_LoadPlaylistCache();
+
+/* ================= SD 卡热插拔支持 =================
+   Music_Init() 开机时 init 了 SD；这里提供运行时探测 / 重连 / 清理，
+   供 src/SdHotplug.cpp 的主循环状态机调用。所有函数都带 SPI 总线锁，
+   可在 UI 线程（core1）直接调用。 */
+
+// 存储卡当前是否「在槽里且可读」。
+// 只在 s_sdReady 为 true（已 mount）时做真实访问：短事务读一下根目录。
+// 卡被拔出时返回 false；卡插着时返回 true。
+bool Music_ProbeStorage();
+
+// 重新初始化 SD 卡（SD.end() + SD.begin()）。
+// 用于「开机没插卡 → 之后插入」这条路径：必须先 mount 才能访问。
+// 成功返回 true 并置 s_sdReady=true；失败置 false。
+bool Music_ReinitStorage();
+
+// 卡已被拔出：停止播放、清空播放列表与曲目信息、标记 SD 不可用。
+// 调用后 UI 应调用 UI_NotifyScreenRebuilt() 刷新界面。
+void Music_HandleCardRemoved();
 // void Music_PlayPause();
 // void Music_Next();
 // void Music_Prev();
@@ -100,10 +119,49 @@ void Music_ResetTrackInfo();
    UI 一旦发现这个函数变 true，就需要为当前曲目补查一次歌词。 */
 bool Music_EmbeddedLyricsReady(const char *path);
 uint32_t Music_GetCurrentPlayTime();
+/* 拖动进度条跳转到指定位置（毫秒）。只能在 UI 线程调用。
+
+   实现方式与已知限制：ESPAudio 的解码器没有对外暴露 seek 能力，
+   所以这里是「按字节位置重新装载解码器」（目标字节 = 文件大小 × 目标时间 / 总时长）。
+   CBR 的 MP3/WAV/FLAC 误差很小；VBR 的 MP3 是按平均码率估算，可能有几秒偏差。
+   调用后立即返回，真正的重开由解码任务在下一轮完成。 */
+void Music_SeekToMs(uint32_t ms);
 // 获取当前曲目内嵌的专辑封面（原始 JPEG 数据）；无封面时返回 false
 // revision 每换一张封面会变化，供 UI 判断是否需要重新解码显示
 bool Music_GetAlbumCover(const uint8_t **data, size_t *size, uint32_t *revision);
 void Music_PlayPath(const char *path);
+
+/* ================= 曲目详情（供「歌曲信息」弹层使用） =================
+
+   为什么要单独搞一个结构体、而不是让 UI 自己去拼：
+   这些字段来自三个不同的地方，散在 UI 里拼会到处出错 ——
+     · 采样率/位深/声道 → 解码时由解码器写到 I2S 输出对象上（不在任何全局变量里）
+     · 时长             → 解码任务的元数据回调跨核写入（必须走 Music_GetDuration）
+     · 文件大小/路径    → 要读 SD 卡（必须持 SPI 总线锁）
+   所以统一在这个函数里取一次，加锁、跨核的细节都收在音乐模块内部。 */
+struct TrackInfo
+{
+    char title[128];    // 标题（无标签时用文件名兜底）
+    char artist[128];   // 艺术家
+    char album[128];    // 专辑
+    char composer[128]; // 作曲家（ID3 TCOM，没有则留空）
+    char path[256];     // 完整路径
+    char format[12];    // 文件格式：MP3 / FLAC / WAV / AAC
+    uint32_t durationSec;  // 时长（秒），0 = 未知
+    uint32_t fileSize;     // 文件字节数，0 = 未知
+    uint32_t sampleRate;   // 采样率 Hz，0 = 未知
+    uint32_t bitrateKbps;  // 平均比特率 kbps，0 = 未知
+    uint8_t bitsPerSample; // 位深 16/24/32，0 = 未知
+    uint8_t channels;      // 声道数 1/2，0 = 未知
+};
+
+/* 取当前曲目的详情，填进 info。返回 false 表示当前没有有效曲目。
+   内部会访问 SD 卡取文件大小，已加总线锁，可在 UI 线程直接调用。 */
+bool Music_GetCurrentTrackInfo(struct TrackInfo *info);
+
+/* 取任意路径对应文件的字节数；失败返回 0。
+   已加 SPI 总线锁，可在 UI 线程直接调用。 */
+uint32_t Music_GetFileSize(const char *path);
 
 // 播放列表相关函数
 bool playlistExists();
@@ -214,6 +272,13 @@ extern "C"
     void Music_Last();
     void setVolume(uint8_t volume);
     uint8_t getVolume();
+
+    /* 音量记忆（NVS）。与 SD 卡无关 —— 卡不可用时音量记忆依然有效。
+       Music_LoadVolume() 在开机时恢复上次音量；
+       Music_SaveVolume() 由 setVolume() 在音量变化时调用，实时落盘。 */
+    void Music_LoadVolume();
+    void Music_SaveVolume();
+
     void switchPlayMode();
 
 #ifdef __cplusplus

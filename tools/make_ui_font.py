@@ -35,6 +35,16 @@ import re
 import subprocess
 import sys
 
+# 复用 gen_lvgl_font_bin.py 里的「代价感知字符集编码 + 自适应合并」工具。
+# 为什么需要它：全量字符集有 4 万多个码点，直接拼命令行会超过 Windows
+# CreateProcess 的 32767 字节上限（WinError 206）。那个脚本已经解决了这个问题
+# （长连续段用 -r、孤立码点用字面量、必要时按级合并区间）。
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    import gen_lvgl_font_bin as gfb
+except ImportError:
+    gfb = None
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_SOURCE = os.path.join(ROOT, 'lib', 'ui', 'src', 'ui_font_AlibabaPuHuiTi12.c')
 LV_FONT_CONV = os.path.join(
@@ -112,6 +122,33 @@ def font_metrics(path):
     }
 
 
+def patch_metrics(path, line_height, base_line):
+    """把生成结果里的 line_height/base_line 改回旧字库的值。
+
+    为什么需要这两个值会变：lv_font_conv 按**所选字符集**里所有字形的最大外接框
+    计算 line_height/base_line。字符集一放大它们就跟着变
+    （实测：7,710 字形 → 15/3；全量 44,812 字形 → 23/7；只选 1 个字 → 11/1）。
+    而界面布局是按 15 调好的，行距一变文本就会溢出/错位。
+
+    为什么改回去是安全的：字形自身的 ofs_y/ofs_x/box_w/box_h/adv_w **只取决于
+    源字体和字号**，与字符集无关（已实测：同一个「中」在单字子集和全量里都是
+    box=10x11 ofs=(1,-1) adv_w=192，与 bin 全量字体也逐字段一致）。
+    所以沿用旧的 line_height/base_line，渲染结果与旧字库逐像素一致。
+    """
+    with open(path, 'r', encoding='utf-8', errors='replace') as fp:
+        txt = fp.read()
+    new, n1 = re.subn(r'\.line_height\s*=\s*-?\d+', '.line_height = %d' % line_height, txt, count=1)
+    new, n2 = re.subn(r'\.base_line\s*=\s*-?\d+', '.base_line = %d' % base_line, new, count=1)
+    if n1 != 1 or n2 != 1:
+        sys.stderr.write('keep-metrics: 改写失败 (line_height=%d hit, base_line=%d hit)\n' % (n1, n2))
+        return False
+    with open(path, 'w', encoding='utf-8') as fp:
+        fp.write(new)
+    print('  keep-metrics: line_height=%d base_line=%d（沿用旧字库，保持界面排版）'
+          % (line_height, base_line))
+    return True
+
+
 def chars_from_files(paths):
     out = set()
     for p in paths:
@@ -159,6 +196,10 @@ def main():
     ap.add_argument('--bpp', type=int, default=None)
     ap.add_argument('--add-chars-from', action='append', default=[],
                     help='file whose characters must also be included (repeatable)')
+    ap.add_argument('--full', action='store_true',
+                    help='用源字体支持的**全部**码点（最全字符集）；此时忽略继承来的 --symbols 表')
+    ap.add_argument('--keep-metrics', action='store_true',
+                    help='生成后把 line_height/base_line 改回继承字体的值，避免字符集变化导致排版走样')
     ap.add_argument('--check', action='store_true', help='report only, do not generate')
     args = ap.parse_args()
 
@@ -200,12 +241,45 @@ def main():
             '--lv-include', lv_include, '--lv-font-name', name]
     for p in args.font:
         argv += ['--font', p]
-    for opt, val in symbols:
-        argv += [opt, val]
-    if extra:
-        # every extra character goes through one more --symbols entry
-        argv += ['--symbols', ''.join(sorted(extra))]
-    argv += ['--no-compress', '-o', out]
+
+    if args.full:
+        # 全量：用源字体 cmap 里的**全部码点**，替掉继承来的那几段 --symbols
+        if gfb is None:
+            raise SystemExit('--full 需要同目录的 gen_lvgl_font_bin.py，导入失败')
+        cps = gfb.sanitize(gfb.load_cmap(args.font[0]))
+        for c in extra:
+            cps.add(ord(c))
+        runs = gfb.coalesce(cps)
+        print('full-charset: %d code points in %d runs' % (len(cps), len(runs)))
+        picked = None
+        for gap in gfb.GAP_LADDER:
+            merged = gfb.merge_ranges(runs, gap) if gap else runs
+            rr, sym = gfb.split_runs(merged)
+            cand = list(argv)
+            for b in gfb.batch_tokens([gfb.fmt_range(a, b2) for (a, b2) in rr],
+                                      gfb.RANGE_BATCH_BYTES):
+                cand += ['-r', b]
+            for s in gfb.batch_tokens(sym, gfb.SYMBOLS_CHUNK_BYTES, sep=''):
+                if s:
+                    cand += ['--symbols=' + s]
+            cand += ['--no-compress', '-o', out]
+            n = gfb.command_line_bytes(cand, LV_FONT_CONV)
+            if n <= gfb.ARGV_BUDGET_BYTES:
+                print('  encoding: %d range token(s) + %d literal symbol(s), merged gaps<=%d'
+                      % (len(rr), len(sym), gap))
+                print('  argv: %d bytes (limit 32767, budget %d)  [OK]' % (n, gfb.ARGV_BUDGET_BYTES))
+                picked = cand
+                break
+        if picked is None:
+            raise SystemExit('无法把字符集压进命令行上限（这不该发生）')
+        argv = picked
+    else:
+        for opt, val in symbols:
+            argv += [opt, val]
+        if extra:
+            # every extra character goes through one more --symbols entry
+            argv += ['--symbols', ''.join(sorted(extra))]
+        argv += ['--no-compress', '-o', out]
 
     print('generating : %s' % os.path.relpath(out, ROOT))
     print('  argv items=%d  total chars=%d' % (len(argv), sum(len(a) + 1 for a in argv)))
@@ -230,6 +304,12 @@ def main():
              after['base_line'], before['base_line'], after['bpp'], after['name']))
     if after['line_height'] != before['line_height'] or after['base_line'] != before['base_line']:
         print('  WARNING: vertical metrics changed -- check the UI layout.')
+
+    if args.keep_metrics and before['line_height'] is not None:
+        patch_metrics(out, before['line_height'], before['base_line'])
+        after = font_metrics(out)
+        print('  metrics now: line_height=%s base_line=%s'
+              % (after['line_height'], after['base_line']))
     if extra:
         miss = extra - {chr(c) for c in after['glyphs']}
         print('  required chars still missing: %d' % len(miss))

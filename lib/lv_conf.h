@@ -423,8 +423,15 @@
 
 /*Enable handling large font and/or fonts with a lot of characters.
  *The limit depends on the font size, font face and bpp.
- *Compiler error will be triggered if a font needs it.*/
-#define LV_FONT_FMT_TXT_LARGE 0
+ *Compiler error will be triggered if a font needs it.
+ * ── 本工程置 1 ──
+ * 内置字体 ui_font_AlibabaPuHuiTi_12 现在是**全量字符集**（约 4.5 万字形，
+ * 未压缩位图约 2.6MB）。LV_FONT_FMT_TXT_LARGE == 0 时
+ * lv_font_fmt_txt_glyph_dsc_t 里的 bitmap_index 只有 20 位（位图上限 1MB），
+ * 超出部分会被截断 —— 表现是「字形全画到错误的位置上」。
+ * 置 1 后 bitmap_index 变 32 位、box/ofs 变 16 位，支持到 4GB 位图。
+ * 代价：字形描述结构体变大，所有字体的描述表都会略微变大。 */
+#define LV_FONT_FMT_TXT_LARGE 1
 
 /*Enables/disables support for compressed fonts.*/
 #define LV_USE_FONT_COMPRESSED 0
